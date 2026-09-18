@@ -366,13 +366,13 @@ export function GeneralTab({ config, onSave, onShortcutChange, onResetShortcuts 
         <div style={{ color: '#ff3b30', fontSize: 12, padding: '4px 16px' }}>
           右 Alt 监听后端未启动，右 Alt 不会触发语音。原因：
           {shortcutStatus.diagnostics.filter(d => !d.startsWith('右 Alt 后端')).join('；') || '未知'}
-          （已收到右 Alt 事件 {shortcutStatus.nativeEventsSeen} 次，派发 {shortcutStatus.nativeEventsDispatched} 次）
+          （已收到右 Alt 事件 {shortcutStatus.nativeEventsSeen} 次，派发 {shortcutStatus.nativeEventsDispatched} 次；按住说话={shortcutStatus.pttMode ? '开' : '关'}；捕获中={shortcutStatus.capturing ? '是' : '否'}）
         </div>
       )}
 
       {config.general.shortcut === 'AltRight' && shortcutStatus?.altRightBackend && (
         <div style={{ color: 'var(--text-secondary)', fontSize: 12, padding: '4px 16px' }}>
-          右 Alt 后端：{shortcutStatus.altRightBackend}；已收到事件 {shortcutStatus.nativeEventsSeen} 次，派发 {shortcutStatus.nativeEventsDispatched} 次
+          右 Alt 后端：{shortcutStatus.altRightBackend}；已收到事件 {shortcutStatus.nativeEventsSeen} 次，派发 {shortcutStatus.nativeEventsDispatched} 次；按住说话={shortcutStatus.pttMode ? '开' : '关'}；捕获中={shortcutStatus.capturing ? '是' : '否'}
         </div>
       )}
 

@@ -116,6 +116,10 @@ impl ConfigManager {
             ));
             migration_notes.extend(outcome.diagnostics.iter().cloned());
             if model_migrated || outcome.changed {
+                // Keep the pre-migration snapshot so a suspicious migration can
+                // be audited or reverted (best effort, never blocks startup).
+                let backup = path.with_file_name("config.pre-migration.json");
+                let _ = atomic_write_value(&backup, &original);
                 // 原子写盘；只有成功后才把迁移视为完成（§15.6）。
                 if let Err(e) = atomic_write_value(path, &raw) {
                     eprintln!("[config] 快捷键迁移写盘失败，将以旧配置运行并在下次启动重试: {e}");

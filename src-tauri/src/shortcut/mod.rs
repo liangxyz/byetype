@@ -97,6 +97,9 @@ pub struct ShortcutStatus {
     pub native_events_seen: u64,
     /// Native events that actually reached business dispatch.
     pub native_events_dispatched: u64,
+    pub ptt_mode: bool,
+    /// True while a frontend capture session is suppressing runtime shortcuts.
+    pub capturing: bool,
     pub diagnostics: Vec<String>,
 }
 
@@ -459,6 +462,8 @@ impl ShortcutManager {
             alt_right_backend: inner.backend_kind.map(|kind| kind.as_str().to_string()),
             native_events_seen: inner.native_events_seen,
             native_events_dispatched: inner.native_events_dispatched,
+            ptt_mode: false,
+            capturing: inner.capture.is_some() || inner.switching,
             diagnostics,
         }
     }
@@ -498,6 +503,12 @@ impl ShortcutManager {
         for note in &migration_notes {
             line.push_str(&format!("    config: {note}\n"));
         }
+        let raw_general = config
+            .get_raw()
+            .get("general")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        line.push_str(&format!("    general: {raw_general}\n"));
         for pair in &graph.pairs {
             line.push_str(&format!(
                 "    conflict: {} <-> {} ({:?})\n",
@@ -802,7 +813,9 @@ pub fn default_primary_shortcut() -> String {
 pub fn shortcut_status(app: &AppHandle) -> ShortcutStatus {
     let manager = app.state::<ShortcutManager>();
     let mode = app.state::<ConfigManager>().schema_mode();
+    let ptt_mode = app.state::<ConfigManager>().get().general.ptt_mode;
     let mut status = manager.status();
+    status.ptt_mode = ptt_mode;
     match mode {
         ShortcutSchemaMode::Supported => {}
         ShortcutSchemaMode::Future => {

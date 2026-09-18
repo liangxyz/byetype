@@ -56,6 +56,8 @@ export interface ShortcutStatus {
   altRightBackend: string | null
   nativeEventsSeen: number
   nativeEventsDispatched: number
+  pttMode: boolean
+  capturing: boolean
   diagnostics: string[]
 }
 
