@@ -1,9 +1,8 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  # 默认只跑 Windows 裸 EXE（windows-exe.yml）。需要完整多平台发布时手动触发本工作流。
+  workflow_dispatch:
 
 jobs:
   release:
