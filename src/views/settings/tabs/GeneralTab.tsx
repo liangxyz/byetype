@@ -308,6 +308,13 @@ export function GeneralTab({ config, onSave, onShortcutChange }: Props) {
         </div>
       )}
 
+      {config.general.shortcut === 'AltRight' && shortcutStatus && !shortcutStatus.altRightBackend && (
+        <div style={{ color: '#ff3b30', fontSize: 12, padding: '4px 16px' }}>
+          右 Alt 监听后端未启动，右 Alt 不会触发语音。原因：
+          {shortcutStatus.diagnostics.filter(d => !d.startsWith('右 Alt 后端')).join('；') || '未知'}
+        </div>
+      )}
+
       <SettingGroup title="其他">
         <SettingRow label="最大录音时长" description="超时自动停止并处理，单位为秒">
           <input

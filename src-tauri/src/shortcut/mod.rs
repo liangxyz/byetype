@@ -149,6 +149,7 @@ struct Inner {
     pressed: [bool; 4],
     alt_right_backend: Option<native::AltRightBackend>,
     backend_kind: Option<BackendKind>,
+    last_registration_errors: Vec<String>,
     voice_slots: [Arc<VoiceSlot>; 2],
 }
 
@@ -211,6 +212,7 @@ impl ShortcutManager {
                 pressed: [false; 4],
                 alt_right_backend: None,
                 backend_kind: None,
+                last_registration_errors: Vec::new(),
                 voice_slots: [Arc::new(VoiceSlot::default()), Arc::new(VoiceSlot::default())],
             }),
             dispatcher: Mutex::new(None),
@@ -417,20 +419,30 @@ impl ShortcutManager {
 
     pub fn status(&self) -> ShortcutStatus {
         let inner = self.lock_inner();
+        let mut diagnostics: Vec<String> = inner
+            .runtime
+            .iter()
+            .filter_map(|field| {
+                field
+                    .skip_reason
+                    .as_ref()
+                    .map(|reason| format!("{}: {}", field.field.label(), reason))
+            })
+            .collect();
+        for error in &inner.last_registration_errors {
+            let line = format!("注册警告: {error}");
+            if !diagnostics.contains(&line) {
+                diagnostics.push(line);
+            }
+        }
+        if let Some(kind) = inner.backend_kind {
+            diagnostics.push(format!("右 Alt 后端: {}", kind.as_str()));
+        }
         ShortcutStatus {
             schema_mode: "supported".to_string(),
             editable: true,
             alt_right_backend: inner.backend_kind.map(|kind| kind.as_str().to_string()),
-            diagnostics: inner
-                .runtime
-                .iter()
-                .filter_map(|field| {
-                    field
-                        .skip_reason
-                        .as_ref()
-                        .map(|reason| format!("{}: {}", field.field.label(), reason))
-                })
-                .collect(),
+            diagnostics,
         }
     }
 
@@ -500,13 +512,22 @@ impl ShortcutManager {
         backend: RegistrationResult,
     ) {
         let mut inner = self.lock_inner();
+        let errors = backend.errors.clone();
         let mut runtime = fields;
         for (index, field) in runtime.iter_mut().enumerate() {
             field.registered = backend.registered[index];
+            if !field.registered && field.uses_native_alt_right && field.skip_reason.is_none() {
+                field.skip_reason = Some(if errors.is_empty() {
+                    "ALT_RIGHT_BACKEND_FAILED: 右 Alt 后端未启动".to_string()
+                } else {
+                    errors.join("; ")
+                });
+            }
         }
         inner.runtime = runtime;
         inner.alt_right_backend = backend.backend;
         inner.backend_kind = backend.backend_kind;
+        inner.last_registration_errors = errors;
         inner.pressed = [false; 4];
         inner.registration_generation = inner.registration_generation.wrapping_add(1);
         inner.switching = false;

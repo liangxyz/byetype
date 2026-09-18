@@ -19,7 +19,7 @@ use windows_sys::Win32::UI::Input::{
     GetRawInputData, GetRegisteredRawInputDevices, RegisterRawInputDevices, HRAWINPUT, RAWINPUT,
     RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIDEV_REMOVE, RIM_TYPEKEYBOARD,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_MENU;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LMENU, VK_MENU, VK_RMENU};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, MSG,
@@ -31,9 +31,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use super::{make_backend, AltRightBackend, BackendKind, EventSink};
 
 /// Raw Input keyboard flag: the key is an extended (E0-prefixed) key. Physical
-/// right Alt is delivered as `VK_MENU + RI_KEY_E0`.
+/// right Alt is delivered as scan code 0x38 with this prefix.
 const RI_KEY_BREAK: u16 = 0x01;
 const RI_KEY_E0: u16 = 0x02;
+
+/// Physical scan code of the Alt key (left and right share it; the E0 prefix
+/// distinguishes the right one).
+const SCANCODE_ALT: u16 = 0x38;
 
 const RAW_INPUT_USAGE_PAGE_GENERIC: u16 = 0x01;
 const RAW_INPUT_USAGE_KEYBOARD: u16 = 0x06;
@@ -147,11 +151,21 @@ unsafe fn handle_raw_input(lparam: LPARAM) {
         return;
     }
     let keyboard = raw.data.keyboard;
-    if keyboard.VKey != VK_MENU || (keyboard.Flags & RI_KEY_E0) == 0 {
+    if !raw_input_is_right_alt(&keyboard) {
         return;
     }
     let pressed = (keyboard.Flags & RI_KEY_BREAK) == 0;
     invoke_callback(pressed);
+}
+
+/// Physical right Alt is defined by the scan code plus the E0 prefix. Relying
+/// on the virtual key alone is unreliable: drivers report either `VK_MENU`
+/// (0x12) or the extended `VK_RMENU` (0xA5).
+fn raw_input_is_right_alt(keyboard: &windows_sys::Win32::UI::Input::RAWKEYBOARD) -> bool {
+    if keyboard.MakeCode == SCANCODE_ALT && (keyboard.Flags & RI_KEY_E0) != 0 {
+        return true;
+    }
+    keyboard.VKey == VK_RMENU
 }
 
 fn start_raw_input(sink: EventSink) -> Result<AltRightBackend, String> {
@@ -281,10 +295,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             let injected = keyboard.flags
                 & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED)
                 != 0;
-            if !injected
-                && keyboard.vkCode == VK_MENU as u32
-                && (keyboard.flags & LLKHF_EXTENDED) != 0
-            {
+            if !injected && hook_is_right_alt(keyboard) {
                 let pressed = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
                 invoke_callback(pressed);
             }
@@ -359,4 +370,22 @@ fn stop_thread(handle: JoinHandle<()>, thread_id: u32) -> Box<dyn FnOnce() + Sen
         }
         let _ = handle.join();
     })
+}
+
+/// Low-level hook right-Alt detection. Uses the physical scan code + extended
+/// flag first, then falls back to the virtual key (`VK_MENU`+E0 or `VK_RMENU`).
+/// Left Alt (`VK_MENU`/`VK_LMENU` without the extended flag) is never matched.
+fn hook_is_right_alt(keyboard: &KBDLLHOOKSTRUCT) -> bool {
+    if keyboard.scanCode == SCANCODE_ALT as u32
+        && (keyboard.flags & LLKHF_EXTENDED) != 0
+    {
+        return true;
+    }
+    keyboard.vkCode == VK_RMENU as u32
+        || (keyboard.vkCode == VK_MENU as u32 && (keyboard.flags & LLKHF_EXTENDED) != 0)
+}
+
+#[allow(dead_code)]
+fn is_left_alt_vk(vk: u32) -> bool {
+    vk == VK_LMENU as u32
 }
