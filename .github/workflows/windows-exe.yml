@@ -32,7 +32,8 @@ jobs:
         run: npm run build
 
       - name: Build Tauri binary (bare exe)
-        run: cargo build --release --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc
+        # custom-protocol 必须开启，否则二进制会按 dev 模式加载 http://localhost:1420
+        run: cargo build --release --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --features tauri/custom-protocol
 
       - name: Upload exe as workflow artifact
         uses: actions/upload-artifact@v4
