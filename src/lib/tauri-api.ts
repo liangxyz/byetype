@@ -27,6 +27,10 @@ export async function updateShortcuts(patch: ShortcutPatch): Promise<ShortcutUpd
   return invoke<ShortcutUpdateResult>('update_shortcuts', { patch })
 }
 
+export async function resetShortcuts(): Promise<ShortcutUpdateResult> {
+  return invoke<ShortcutUpdateResult>('reset_shortcuts')
+}
+
 export async function beginShortcutCapture(field: string): Promise<number> {
   return invoke<number>('begin_shortcut_capture', { field })
 }

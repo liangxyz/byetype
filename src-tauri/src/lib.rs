@@ -41,6 +41,7 @@ pub fn run() {
             commands::save_config,
             commands::get_shortcut_status,
             commands::update_shortcuts,
+            commands::reset_shortcuts,
             commands::begin_shortcut_capture,
             commands::commit_shortcut_capture,
             commands::end_shortcut_capture,

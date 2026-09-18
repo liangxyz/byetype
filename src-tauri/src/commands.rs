@@ -122,6 +122,22 @@ pub fn update_shortcuts(
     crate::shortcut::update_shortcuts(&app, recorder.inner().clone(), patch)
 }
 
+/// Reset the four shortcuts to platform defaults. Useful when a migrated config
+/// left the shortcut component in a conflicted/skipped state.
+#[tauri::command]
+pub fn reset_shortcuts(
+    app: tauri::AppHandle,
+    recorder: State<'_, Arc<AudioRecorder>>,
+) -> Result<crate::shortcut::ShortcutUpdateResult, String> {
+    let patch = crate::shortcut::ShortcutPatch {
+        shortcut: Some(crate::shortcut::default_primary_shortcut()),
+        shortcut2: Some(String::new()),
+        extract_shortcut: Some("F6".to_string()),
+        extract_shortcut2: Some(String::new()),
+    };
+    crate::shortcut::update_shortcuts(&app, recorder.inner().clone(), patch)
+}
+
 fn parse_shortcut_field(field: &str) -> Result<crate::shortcut::ShortcutField, String> {
     crate::shortcut::ShortcutField::parse_key(field)
         .ok_or_else(|| format!("未知快捷键字段: {field}"))

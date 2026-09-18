@@ -19,6 +19,9 @@ struct ConfigState {
     /// failed). Preserves unknown fields and the shortcut schema marker.
     raw: Value,
     schema_mode: ShortcutSchemaMode,
+    /// Human readable notes about the last shortcut migration; surfaced in the
+    /// shortcut diagnostics log.
+    migration_notes: Vec<String>,
 }
 
 pub struct ConfigManager {
@@ -66,6 +69,7 @@ impl ConfigManager {
                 config,
                 schema_mode: schema_mode(&raw),
                 raw,
+                migration_notes: vec!["新配置文件（无历史迁移）".to_string()],
             };
         }
 
@@ -87,6 +91,10 @@ impl ConfigManager {
 
         let original = raw.clone();
         let mode = schema_mode(&raw);
+        let mut migration_notes = vec![format!(
+            "磁盘原始: {}",
+            shortcut_config::raw_shortcut_summary(&original)
+        )];
 
         if mode == ShortcutSchemaMode::Supported {
             // 现有非快捷键迁移（模型 ID 等）；与本次快捷键需求无关但必须保留。
@@ -97,20 +105,38 @@ impl ConfigManager {
                     | shortcut_config::RawSchemaVersion::Version(0)
             );
             let outcome = migrate_shortcuts(&mut raw, is_windows(), schema_lt_1);
+            migration_notes.push(format!(
+                "迁移: model={} changed={} f4_replaced={} f4_kept_conflict={} future={} schema_completed={}",
+                model_migrated,
+                outcome.changed,
+                outcome.f4_replaced,
+                outcome.f4_kept_conflict,
+                outcome.future_mode,
+                outcome.schema_completed
+            ));
+            migration_notes.extend(outcome.diagnostics.iter().cloned());
             if model_migrated || outcome.changed {
                 // 原子写盘；只有成功后才把迁移视为完成（§15.6）。
                 if let Err(e) = atomic_write_value(path, &raw) {
                     eprintln!("[config] 快捷键迁移写盘失败，将以旧配置运行并在下次启动重试: {e}");
+                    migration_notes.push(format!("迁移写盘失败: {e}"));
                     raw = original;
                 }
             }
+        } else {
+            migration_notes.push("进入 FutureSchemaMode：不自动迁移/写回".to_string());
         }
+        migration_notes.push(format!(
+            "迁移后: {}",
+            shortcut_config::raw_shortcut_summary(&raw)
+        ));
 
         let config = deserialize_config(&raw);
         ConfigState {
             config,
             schema_mode: mode,
             raw,
+            migration_notes,
         }
     }
 
@@ -121,7 +147,17 @@ impl ConfigManager {
             config,
             schema_mode: schema_mode(&raw),
             raw,
+            migration_notes: vec!["配置读取/解析失败，使用默认值".to_string()],
         }
+    }
+
+    /// Notes captured while loading/migrating the shortcut config.
+    pub fn migration_notes(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .migration_notes
+            .clone()
     }
 
     pub fn get(&self) -> AppConfig {

@@ -326,6 +326,28 @@ fn value_label(value: &str) -> String {
     }
 }
 
+/// One-line summary of the on-disk shortcut state, for diagnostics.
+pub fn raw_shortcut_summary(raw: &Value) -> String {
+    let mut parts = Vec::new();
+    for field in ShortcutField::ALL {
+        let value = raw
+            .get("general")
+            .and_then(|general| general.get(field.key()));
+        parts.push(format!(
+            "{}={}",
+            field.key(),
+            value
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<missing>".to_string())
+        ));
+    }
+    format!(
+        "schema={:?} {}",
+        parse_schema_version(raw),
+        parts.join(" ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -473,16 +473,39 @@ impl ShortcutManager {
     /// Append the current shortcut registration state to `<app_data_dir>/shortcut.log`
     /// so a failing native backend can be diagnosed without a debugger.
     fn log_registration(&self, app: &AppHandle, phase: &str) {
+        let config = app.state::<ConfigManager>();
+        let app_config = config.get();
+        let migration_notes = config.migration_notes();
+        let schema_mode = match config.schema_mode() {
+            ShortcutSchemaMode::Supported => "supported",
+            ShortcutSchemaMode::Future => "future",
+        };
         let inner = self.lock_inner();
+        let normalized: [NormalizedShortcut; 4] =
+            std::array::from_fn(|i| inner.runtime[i].normalized.clone());
+        let graph = build_conflict_graph(&normalized);
         let mut line = format!(
-            "[{}] backend={:?} switching={} native_seen={} native_dispatched={} errors={:?}\n",
+            "[{}] backend={:?} schema={} ptt={} switching={} native_seen={} native_dispatched={} errors={:?}\n",
             phase,
             inner.backend_kind,
+            schema_mode,
+            app_config.general.ptt_mode,
             inner.switching,
             inner.native_events_seen,
             inner.native_events_dispatched,
             inner.last_registration_errors
         );
+        for note in &migration_notes {
+            line.push_str(&format!("    config: {note}\n"));
+        }
+        for pair in &graph.pairs {
+            line.push_str(&format!(
+                "    conflict: {} <-> {} ({:?})\n",
+                pair.left.key(),
+                pair.right.key(),
+                pair.kind
+            ));
+        }
         for field in &inner.runtime {
             line.push_str(&format!(
                 "    {} value={:?} normalized={:?} registered={} native={} skip={:?}\n",
@@ -499,6 +522,12 @@ impl ShortcutManager {
         if let Ok(dir) = app.path().app_data_dir() {
             let _ = std::fs::create_dir_all(&dir);
             let path = dir.join("shortcut.log");
+            // Bound the log so it cannot grow forever.
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.len() > 512 * 1024 {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
             use std::io::Write;
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
@@ -762,6 +791,12 @@ pub fn update_shortcuts(
 ) -> Result<ShortcutUpdateResult, String> {
     let manager = app.state::<ShortcutManager>();
     manager.update_shortcuts(app, &recorder, &patch)
+}
+
+/// Platform default for 语音输入 1, used by the "reset shortcuts" action.
+pub fn default_primary_shortcut() -> String {
+    crate::config::shortcut_config::platform_default(ShortcutField::Shortcut, is_windows())
+        .to_string()
 }
 
 pub fn shortcut_status(app: &AppHandle) -> ShortcutStatus {

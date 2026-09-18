@@ -40,9 +40,10 @@ interface Props {
   config: AppConfig
   onSave: (config: AppConfig) => void
   onShortcutChange: (patch: ShortcutPatch) => Promise<void>
+  onResetShortcuts: () => Promise<void>
 }
 
-export function GeneralTab({ config, onSave, onShortcutChange }: Props) {
+export function GeneralTab({ config, onSave, onShortcutChange, onResetShortcuts }: Props) {
   const [devices, setDevices] = useState<AudioDevice[]>([])
   const [conflictMsg, setConflictMsg] = useState('')
   const [shortcutStatus, setShortcutStatus] = useState<ShortcutStatus | null>(null)
@@ -119,21 +120,38 @@ export function GeneralTab({ config, onSave, onShortcutChange }: Props) {
 
   useEffect(() => {
     let disposed = false
+    let timer: ReturnType<typeof setInterval> | null = null
     const load = () => {
       getShortcutStatus()
         .then(status => { if (!disposed) setShortcutStatus(status) })
         .catch(error => console.error('Failed to get shortcut status:', error))
     }
-    load()
-    const timer = setInterval(load, 2000)
-    const onFocus = () => load()
-    window.addEventListener('focus', onFocus)
-    document.addEventListener('visibilitychange', onFocus)
+    const startTimer = () => {
+      if (timer === null) timer = setInterval(load, 2000)
+    }
+    const stopTimer = () => {
+      if (timer !== null) {
+        clearInterval(timer)
+        timer = null
+      }
+    }
+    // Only poll while the settings page is visible; hidden windows stop polling.
+    const syncVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        load()
+        startTimer()
+      } else {
+        stopTimer()
+      }
+    }
+    syncVisibility()
+    window.addEventListener('focus', load)
+    document.addEventListener('visibilitychange', syncVisibility)
     return () => {
       disposed = true
-      clearInterval(timer)
-      window.removeEventListener('focus', onFocus)
-      document.removeEventListener('visibilitychange', onFocus)
+      stopTimer()
+      window.removeEventListener('focus', load)
+      document.removeEventListener('visibilitychange', syncVisibility)
     }
   }, [])
 
@@ -248,6 +266,28 @@ export function GeneralTab({ config, onSave, onShortcutChange }: Props) {
             checked={config.general.overwriteClipboard !== false}
             onChange={checked => update({ overwriteClipboard: checked })}
           />
+        </SettingRow>
+        <SettingRow
+          label="恢复默认快捷键"
+          description="将四个快捷键重置为默认值（语音输入 1 = 右 Alt，截图取词 = F6，其余为空）"
+        >
+          <button
+            className="file-picker-btn"
+            onClick={async () => {
+              if (!window.confirm('确定把四个快捷键恢复为默认值吗？')) return
+              try {
+                await onResetShortcuts()
+              } catch (error: unknown) {
+                showShortcutError(
+                  typeof error === 'string'
+                    ? error
+                    : (error as { message?: string } | null)?.message || '恢复默认快捷键失败',
+                )
+              }
+            }}
+          >
+            恢复默认
+          </button>
         </SettingRow>
       </SettingGroup>
 
