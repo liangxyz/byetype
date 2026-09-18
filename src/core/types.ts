@@ -54,6 +54,8 @@ export interface ShortcutStatus {
   schemaMode: 'supported' | 'future'
   editable: boolean
   altRightBackend: string | null
+  nativeEventsSeen: number
+  nativeEventsDispatched: number
   diagnostics: string[]
 }
 

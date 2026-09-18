@@ -93,6 +93,10 @@ pub struct ShortcutStatus {
     /// True when the shortcut section may be edited without risking the config.
     pub editable: bool,
     pub alt_right_backend: Option<String>,
+    /// Native right-Alt events observed at the source (hook/raw input).
+    pub native_events_seen: u64,
+    /// Native events that actually reached business dispatch.
+    pub native_events_dispatched: u64,
     pub diagnostics: Vec<String>,
 }
 
@@ -150,6 +154,8 @@ struct Inner {
     alt_right_backend: Option<native::AltRightBackend>,
     backend_kind: Option<BackendKind>,
     last_registration_errors: Vec<String>,
+    native_events_seen: u64,
+    native_events_dispatched: u64,
     voice_slots: [Arc<VoiceSlot>; 2],
 }
 
@@ -213,6 +219,8 @@ impl ShortcutManager {
                 alt_right_backend: None,
                 backend_kind: None,
                 last_registration_errors: Vec::new(),
+                native_events_seen: 0,
+                native_events_dispatched: 0,
                 voice_slots: [Arc::new(VoiceSlot::default()), Arc::new(VoiceSlot::default())],
             }),
             dispatcher: Mutex::new(None),
@@ -331,6 +339,13 @@ impl ShortcutManager {
             return;
         }
 
+        {
+            if matches!(msg, DispatchMsg::AltRight { .. }) {
+                let mut inner = self.lock_inner();
+                inner.native_events_dispatched = inner.native_events_dispatched.wrapping_add(1);
+            }
+        }
+
         match field {
             ShortcutField::Shortcut | ShortcutField::Shortcut2 => {
                 let voice_index = if field == ShortcutField::Shortcut { 0 } else { 1 };
@@ -442,6 +457,8 @@ impl ShortcutManager {
             schema_mode: "supported".to_string(),
             editable: true,
             alt_right_backend: inner.backend_kind.map(|kind| kind.as_str().to_string()),
+            native_events_seen: inner.native_events_seen,
+            native_events_dispatched: inner.native_events_dispatched,
             diagnostics,
         }
     }
@@ -450,6 +467,46 @@ impl ShortcutManager {
         match self.inner.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Append the current shortcut registration state to `<app_data_dir>/shortcut.log`
+    /// so a failing native backend can be diagnosed without a debugger.
+    fn log_registration(&self, app: &AppHandle, phase: &str) {
+        let inner = self.lock_inner();
+        let mut line = format!(
+            "[{}] backend={:?} switching={} native_seen={} native_dispatched={} errors={:?}\n",
+            phase,
+            inner.backend_kind,
+            inner.switching,
+            inner.native_events_seen,
+            inner.native_events_dispatched,
+            inner.last_registration_errors
+        );
+        for field in &inner.runtime {
+            line.push_str(&format!(
+                "    {} value={:?} normalized={:?} registered={} native={} skip={:?}\n",
+                field.field.key(),
+                field.value,
+                field.normalized,
+                field.registered,
+                field.uses_native_alt_right,
+                field.skip_reason
+            ));
+        }
+        drop(inner);
+        eprintln!("[shortcut] {line}");
+        if let Ok(dir) = app.path().app_data_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("shortcut.log");
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = file.write_all(line.as_bytes());
+            }
         }
     }
 
@@ -555,6 +612,7 @@ impl ShortcutManager {
             eprintln!("[shortcut] 启动注册警告: {error}");
         }
         self.commit_runtime(fields, result);
+        self.log_registration(app, "startup");
         Ok(())
     }
 
@@ -668,6 +726,7 @@ impl ShortcutManager {
 
         let backend_kind = result.backend_kind;
         self.commit_runtime(fields, result);
+        self.log_registration(app, "update");
 
         Ok(build_update_result(&normalized, backend_kind, &persist))
     }
@@ -867,6 +926,10 @@ fn make_native_sink(app: &AppHandle) -> native::EventSink {
     let app = app.clone();
     Arc::new(move |pressed: bool| {
         let manager = app.state::<ShortcutManager>();
+        {
+            let mut inner = manager.lock_inner();
+            inner.native_events_seen = inner.native_events_seen.wrapping_add(1);
+        }
         let snapshot = manager.snapshot();
         manager.enqueue(DispatchMsg::AltRight { pressed, snapshot });
     })
