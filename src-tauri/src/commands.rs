@@ -81,18 +81,42 @@ pub async fn save_config(
             .then_some(config.general.text_strengthening_enabled),
     };
 
+    let shortcut_domain_changed = !domain_patch.is_empty();
+
     // 2. 如果快捷键域有变动，在领域锁内完成严格切换与原子写盘（包括键位、模板及强化开关）
-    if !domain_patch.is_empty() {
+    if shortcut_domain_changed {
         crate::shortcut::update_shortcut_settings(&app, &recorder, &domain_patch)?;
     }
 
     // 3. 保存非快捷键配置（Local API 与其他通用设置）
-    local_api_manager
+    if let Err(error) = local_api_manager
         .configure(app.clone(), &config.local_api)
-        .await?;
+        .await
+    {
+        if shortcut_domain_changed {
+            return Err(format!(
+                "PARTIAL_SUCCESS: 快捷键配置已保存生效，但本地服务接口配置失败: {error}"
+            ));
+        }
+        return Err(error);
+    }
 
     // ConfigManager::update 受 SHORTCUT_DOMAIN_KEYS 保护，绝不会覆盖快捷键、模板与强化开关
-    config_manager.update(config)?;
+    if let Err(error) = config_manager.update(config) {
+        let rollback_res = local_api_manager
+            .configure(app.clone(), &old_config.local_api)
+            .await;
+        let rollback_msg = match rollback_res {
+            Ok(()) => String::new(),
+            Err(e) => format!("（且本地服务接口回滚亦失败: {e}）"),
+        };
+        if shortcut_domain_changed {
+            return Err(format!(
+                "PARTIAL_SUCCESS: 快捷键配置已保存生效，但通用设置保存失败: {error}{rollback_msg}"
+            ));
+        }
+        return Err(format!("{error}{rollback_msg}"));
+    }
 
     Ok(true)
 }
