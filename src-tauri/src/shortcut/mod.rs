@@ -26,7 +26,7 @@ pub use model::ShortcutField;
 pub use native::BackendKind;
 
 use model::{
-    build_conflict_graph, is_alt_right, validate_candidates, NormalizedShortcut, ALT_RIGHT,
+    build_conflict_graph, is_alt_right, NormalizedShortcut, ALT_RIGHT,
 };
 
 /// PTT 模式下，按住时间小于此阈值视为误触，丢弃录音。
@@ -638,8 +638,16 @@ impl ShortcutManager {
         let values = shortcut_values(&config);
         let templates = shortcut_templates(&config);
         let normalized = normalized_from_values(&values);
-        let graph = build_conflict_graph(&normalized);
-        let fields = build_fields(&values, &normalized, &graph, &templates);
+        let active = active_fields(&config);
+        let conflict_candidates = std::array::from_fn(|i| {
+            if active[i] {
+                normalized[i].clone()
+            } else {
+                NormalizedShortcut::Empty
+            }
+        });
+        let graph = build_conflict_graph(&conflict_candidates);
+        let fields = build_fields(&values, &normalized, &graph, &templates, &active);
 
         let _guard = self.lock_update();
         {
@@ -683,7 +691,8 @@ impl ShortcutManager {
         apply_patch_to_values(&mut values, &mut changed, patch);
 
         let normalized = normalized_from_values(&values);
-        validate_candidates(&normalized, &changed).map_err(|error| {
+        let active = active_fields(&current);
+        model::validate_candidates_with_active(&normalized, &changed, &active).map_err(|error| {
             format!("{}: {}", error.code, error.message)
         })?;
 
@@ -698,8 +707,15 @@ impl ShortcutManager {
             }
         }
 
-        let graph = build_conflict_graph(&normalized);
-        let fields = build_fields(&values, &normalized, &graph, &templates);
+        let conflict_candidates = std::array::from_fn(|i| {
+            if active[i] {
+                normalized[i].clone()
+            } else {
+                NormalizedShortcut::Empty
+            }
+        });
+        let graph = build_conflict_graph(&conflict_candidates);
+        let fields = build_fields(&values, &normalized, &graph, &templates, &active);
 
         let old_fields = { self.lock_inner().runtime.clone() };
 
@@ -765,10 +781,10 @@ impl ShortcutManager {
         }
 
         let backend_kind = result.backend_kind;
-        self.commit_runtime(fields, result);
+        self.commit_runtime(fields.clone(), result);
         self.log_registration(app, "update");
 
-        Ok(build_update_result(&normalized, backend_kind, &persist))
+        Ok(build_update_result(&fields, &normalized, backend_kind, &persist))
     }
 }
 
@@ -813,9 +829,15 @@ pub fn default_primary_shortcut() -> String {
 pub fn shortcut_status(app: &AppHandle) -> ShortcutStatus {
     let manager = app.state::<ShortcutManager>();
     let mode = app.state::<ConfigManager>().schema_mode();
-    let ptt_mode = app.state::<ConfigManager>().get().general.ptt_mode;
+    let config = app.state::<ConfigManager>().get();
+    let ptt_mode = config.general.ptt_mode;
     let mut status = manager.status();
     status.ptt_mode = ptt_mode;
+    if !config.general.text_strengthening_enabled {
+        status
+            .diagnostics
+            .push("文本强化已关闭：语音输入 2 暂未激活".to_string());
+    }
     match mode {
         ShortcutSchemaMode::Supported => {}
         ShortcutSchemaMode::Future => {
@@ -833,7 +855,16 @@ pub fn shortcut_status(app: &AppHandle) -> ShortcutStatus {
 
 // ==================== Value helpers ====================
 
-fn shortcut_values(config: &crate::config::types::AppConfig) -> [String; 4] {
+pub(crate) fn active_fields(config: &crate::config::types::AppConfig) -> [bool; 4] {
+    [
+        true,
+        config.general.text_strengthening_enabled,
+        true,
+        true,
+    ]
+}
+
+pub(crate) fn shortcut_values(config: &crate::config::types::AppConfig) -> [String; 4] {
     [
         config.general.shortcut.clone(),
         config.general.shortcut2.clone(),
@@ -851,7 +882,7 @@ fn shortcut_templates(config: &crate::config::types::AppConfig) -> [String; 4] {
     ]
 }
 
-fn normalized_from_values(values: &[String; 4]) -> [NormalizedShortcut; 4] {
+pub(crate) fn normalized_from_values(values: &[String; 4]) -> [NormalizedShortcut; 4] {
     std::array::from_fn(|i| model::normalize(&values[i]))
 }
 
@@ -879,6 +910,7 @@ fn build_fields(
     normalized: &[NormalizedShortcut; 4],
     graph: &model::ConflictGraph,
     templates: &[String; 4],
+    active: &[bool; 4],
 ) -> [FieldRuntime; 4] {
     std::array::from_fn(|index| {
         let field = ShortcutField::ALL[index];
@@ -886,6 +918,13 @@ fn build_fields(
         runtime.value = values[index].clone();
         runtime.normalized = normalized[index].clone();
         runtime.template = templates[index].clone();
+
+        if !active[index] {
+            runtime.registered = false;
+            runtime.uses_native_alt_right = false;
+            runtime.skip_reason = Some("TEXT_STRENGTHENING_DISABLED: 文本强化已关闭".to_string());
+            return runtime;
+        }
 
         match &normalized[index] {
             NormalizedShortcut::Empty => {}
@@ -932,6 +971,7 @@ fn build_persist_patch(
 }
 
 fn build_update_result(
+    fields: &[FieldRuntime; 4],
     normalized: &[NormalizedShortcut; 4],
     backend_kind: Option<BackendKind>,
     persist: &[(ShortcutField, String)],
@@ -954,8 +994,8 @@ fn build_update_result(
             FieldResult {
                 field: field.key().to_string(),
                 value: persisted.unwrap_or_else(|| confirmed(index)),
-                registered: matches!(normalized[index], NormalizedShortcut::Valid(_)),
-                error: None,
+                registered: fields[index].registered,
+                error: fields[index].skip_reason.clone(),
             }
         })
         .collect();
@@ -1303,10 +1343,53 @@ mod tests {
         let normalized = normalized_from_values(&values);
         let graph = build_conflict_graph(&normalized);
         let templates = std::array::from_fn(|_| String::new());
-        let fields = build_fields(&values, &normalized, &graph, &templates);
+        let fields = build_fields(&values, &normalized, &graph, &templates, &[true; 4]);
         assert!(!fields[0].registered);
         assert!(!fields[1].registered);
         assert!(fields[0].skip_reason.is_some());
+    }
+
+    #[test]
+    fn strengthening_disabled_deactivates_shortcut2() {
+        let values = [
+            "AltRight".to_string(),
+            "AltRight".to_string(),
+            String::new(),
+            String::new(),
+        ];
+        let normalized = normalized_from_values(&values);
+        let active = [true, false, true, true];
+        let conflict_candidates = std::array::from_fn(|i| {
+            if active[i] {
+                normalized[i].clone()
+            } else {
+                NormalizedShortcut::Empty
+            }
+        });
+        let graph = build_conflict_graph(&conflict_candidates);
+        let templates = std::array::from_fn(|_| String::new());
+        let fields = build_fields(&values, &normalized, &graph, &templates, &active);
+
+        // slot 0 should be registered and use native alt-right
+        assert!(fields[0].registered);
+        assert!(fields[0].uses_native_alt_right);
+
+        // slot 1 (shortcut2) should NOT be registered, NOT use native alt-right, and have skip_reason
+        assert!(!fields[1].registered);
+        assert!(!fields[1].uses_native_alt_right);
+        assert_eq!(
+            fields[1].skip_reason.as_deref(),
+            Some("TEXT_STRENGTHENING_DISABLED: 文本强化已关闭")
+        );
+
+        // Result should reflect actual registration status (slot 1 registered: false)
+        let result = build_update_result(&fields, &normalized, None, &[]);
+        assert!(result.per_field[0].registered);
+        assert!(!result.per_field[1].registered);
+        assert_eq!(
+            result.per_field[1].error.as_deref(),
+            Some("TEXT_STRENGTHENING_DISABLED: 文本强化已关闭")
+        );
     }
 
     #[test]

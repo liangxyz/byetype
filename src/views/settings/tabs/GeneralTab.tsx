@@ -1,5 +1,12 @@
 import React, { useEffect, useState } from 'react'
-import { AppConfig, AudioDevice, LocalApiStatus, ShortcutPatch, ShortcutStatus, ThemeMode } from '../../../core/types'
+import {
+  AppConfig,
+  AudioDevice,
+  LocalApiStatus,
+  ShortcutPatch,
+  ShortcutStatus,
+  ThemeMode,
+} from '../../../core/types'
 import {
   getLaunchAtLogin,
   getLocalApiStatus,
@@ -11,15 +18,15 @@ import {
 import { SettingGroup } from '../components/SettingGroup'
 import { SettingRow } from '../components/SettingRow'
 import { Toggle } from '../components/Toggle'
-import { EditableLabel } from '../components/EditableLabel'
 import { ShortcutInput } from '../components/ShortcutInput'
 
-const DEFAULT_LABELS = {
-  shortcut: '语音输入 1',
-  shortcut2: '语音输入 2',
-  extractShortcut: '截图取词',
-  extractShortcut2: '截图翻译',
-} as const
+/** 语音入口固定名称，不再允许自定义 */
+const VOICE_PLAIN_LABEL = '语音输入'
+const VOICE_LABEL_1 = '语音输入 1'
+const VOICE_LABEL_2 = '语音输入 2'
+/** 图像入口固定名称 */
+const IMAGE_LABEL_1 = '图片识别1'
+const IMAGE_LABEL_2 = '图片识别2'
 
 const IS_MACOS = navigator.platform.toUpperCase().includes('MAC')
 
@@ -34,6 +41,30 @@ function formatShortcutDisplay(combo: string): string {
     .replace(/Shift/g, '\u21E7')
     .replace(/Alt/g, '\u2325')
     .replace(/Ctrl/g, '\u2303')
+}
+
+interface TemplateSelectProps {
+  value: string
+  templates: { id: string; name: string }[]
+  onChange: (templateId: string) => void
+}
+
+function TemplateSelect({ value, templates, onChange }: TemplateSelectProps) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+      <span style={{ fontSize: 12, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>输出风格</span>
+      <select
+        className="select"
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        style={{ minWidth: 100 }}
+      >
+        {templates.map(t => (
+          <option key={t.id} value={t.id}>{t.name}</option>
+        ))}
+      </select>
+    </div>
+  )
 }
 
 interface Props {
@@ -111,12 +142,8 @@ export function GeneralTab({ config, onSave, onShortcutChange, onResetShortcuts 
 
   const curlCommand = `curl -fsS -X POST --data-binary @recording.m4a -H 'Content-Type: audio/mp4' 'http://127.0.0.1:${config.localApi.port}/transcribe'`
 
-  const labelOf = {
-    shortcut: config.general.shortcutLabel?.trim() || DEFAULT_LABELS.shortcut,
-    shortcut2: config.general.shortcut2Label?.trim() || DEFAULT_LABELS.shortcut2,
-    extractShortcut: config.general.extractShortcutLabel?.trim() || DEFAULT_LABELS.extractShortcut,
-    extractShortcut2: config.general.extractShortcut2Label?.trim() || DEFAULT_LABELS.extractShortcut2,
-  }
+  const strengtheningEnabled = config.general.textStrengtheningEnabled !== false
+  const voiceTemplates = config.voiceTemplates.templates ?? []
 
   useEffect(() => {
     let disposed = false
@@ -166,6 +193,21 @@ export function GeneralTab({ config, onSave, onShortcutChange, onResetShortcuts 
     await onShortcutChange({ [field]: value } as ShortcutPatch)
   }
 
+  // 开关只切换 enabled，不改任何模板选择与快捷键；
+  // 旧配置里「输出风格选无」存的是空模板，打开时补一个可用默认项。
+  const setStrengthening = (enabled: boolean) => {
+    if (!enabled) {
+      update({ textStrengtheningEnabled: false })
+      return
+    }
+    update({
+      textStrengtheningEnabled: true,
+      shortcutTemplate: config.general.shortcutTemplate || voiceTemplates[0]?.id || '',
+      shortcut2Template:
+        config.general.shortcut2Template || voiceTemplates[1]?.id || voiceTemplates[0]?.id || '',
+    })
+  }
+
   const themes: { value: ThemeMode; label: string; style: React.CSSProperties }[] = [
     { value: 'light', label: '浅色', style: { background: '#ffffff', border: '1px solid #d2d2d7' } },
     { value: 'dark', label: '深色', style: { background: '#1c1c1e' } },
@@ -194,64 +236,65 @@ export function GeneralTab({ config, onSave, onShortcutChange, onResetShortcuts 
       </SettingGroup>
 
       <SettingGroup title="语音输入">
-        <SettingRow label={
-          <EditableLabel
-            value={labelOf.shortcut}
-            defaultValue={DEFAULT_LABELS.shortcut}
-            onChange={next => update({ shortcutLabel: next })}
-          />
-        }>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <span style={{ fontSize: 12, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>输出风格</span>
-            <select
-              className="select"
-              value={config.general.shortcutTemplate}
-              onChange={e => update({ shortcutTemplate: e.target.value })}
-              style={{ minWidth: 100 }}
-            >
-              <option value="">无</option>
-              {config.voiceTemplates.templates.map(t => (
-                <option key={t.id} value={t.id}>{t.name}</option>
-              ))}
-            </select>
-            <ShortcutInput
-              field="shortcut"
-              display={formatShortcutDisplay(config.general.shortcut)}
-              disabled={!shortcutEditable}
-              onCommit={handleShortcutCommit}
-              onError={showShortcutError}
-            />
-          </div>
+        {!strengtheningEnabled && (
+          <SettingRow label={VOICE_PLAIN_LABEL}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <ShortcutInput
+                field="shortcut"
+                display={formatShortcutDisplay(config.general.shortcut)}
+                disabled={!shortcutEditable}
+                onCommit={handleShortcutCommit}
+                onError={showShortcutError}
+              />
+            </div>
+          </SettingRow>
+        )}
+        <SettingRow
+          label={
+            <span className="mode-label">
+              文本强化
+              <span className="strengthening-formula">（语音识别文本＋强化规则＝最终文本）</span>
+            </span>
+          }
+        >
+          <Toggle checked={strengtheningEnabled} onChange={setStrengthening} />
         </SettingRow>
-        <SettingRow label={
-          <EditableLabel
-            value={labelOf.shortcut2}
-            defaultValue={DEFAULT_LABELS.shortcut2}
-            onChange={next => update({ shortcut2Label: next })}
-          />
-        }>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <span style={{ fontSize: 12, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>输出风格</span>
-            <select
-              className="select"
-              value={config.general.shortcut2Template}
-              onChange={e => update({ shortcut2Template: e.target.value })}
-              style={{ minWidth: 100 }}
-            >
-              <option value="">无</option>
-              {config.voiceTemplates.templates.map(t => (
-                <option key={t.id} value={t.id}>{t.name}</option>
-              ))}
-            </select>
-            <ShortcutInput
-              field="shortcut2"
-              display={formatShortcutDisplay(config.general.shortcut2)}
-              disabled={!shortcutEditable}
-              onCommit={handleShortcutCommit}
-              onError={showShortcutError}
-            />
+        {strengtheningEnabled && (
+          <div className="strengthened-voice-inputs">
+            <SettingRow label={VOICE_LABEL_1}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <TemplateSelect
+                  value={config.general.shortcutTemplate}
+                  templates={voiceTemplates}
+                  onChange={templateId => update({ shortcutTemplate: templateId })}
+                />
+                <ShortcutInput
+                  field="shortcut"
+                  display={formatShortcutDisplay(config.general.shortcut)}
+                  disabled={!shortcutEditable}
+                  onCommit={handleShortcutCommit}
+                  onError={showShortcutError}
+                />
+              </div>
+            </SettingRow>
+            <SettingRow label={VOICE_LABEL_2}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <TemplateSelect
+                  value={config.general.shortcut2Template}
+                  templates={voiceTemplates}
+                  onChange={templateId => update({ shortcut2Template: templateId })}
+                />
+                <ShortcutInput
+                  field="shortcut2"
+                  display={formatShortcutDisplay(config.general.shortcut2)}
+                  disabled={!shortcutEditable}
+                  onCommit={handleShortcutCommit}
+                  onError={showShortcutError}
+                />
+              </div>
+            </SettingRow>
           </div>
-        </SettingRow>
+        )}
         <SettingRow label="按住说话模式" description="开启后按住快捷键期间录音，松开立即识别">
           <Toggle
             checked={!!config.general.pttMode}
@@ -292,25 +335,13 @@ export function GeneralTab({ config, onSave, onShortcutChange, onResetShortcuts 
       </SettingGroup>
 
       <SettingGroup title="图像识别">
-        <SettingRow label={
-          <EditableLabel
-            value={labelOf.extractShortcut}
-            defaultValue={DEFAULT_LABELS.extractShortcut}
-            onChange={next => update({ extractShortcutLabel: next })}
-          />
-        }>
+        <SettingRow label={IMAGE_LABEL_1}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <span style={{ fontSize: 12, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>输出风格</span>
-            <select
-              className="select"
+            <TemplateSelect
               value={config.general.extractShortcutTemplate}
-              onChange={e => update({ extractShortcutTemplate: e.target.value })}
-              style={{ minWidth: 100 }}
-            >
-              {config.extract.templates.map(t => (
-                <option key={t.id} value={t.id}>{t.name}</option>
-              ))}
-            </select>
+              templates={config.extract.templates}
+              onChange={templateId => update({ extractShortcutTemplate: templateId })}
+            />
             <ShortcutInput
               field="extractShortcut"
               display={formatShortcutDisplay(config.general.extractShortcut)}
@@ -320,25 +351,13 @@ export function GeneralTab({ config, onSave, onShortcutChange, onResetShortcuts 
             />
           </div>
         </SettingRow>
-        <SettingRow label={
-          <EditableLabel
-            value={labelOf.extractShortcut2}
-            defaultValue={DEFAULT_LABELS.extractShortcut2}
-            onChange={next => update({ extractShortcut2Label: next })}
-          />
-        }>
+        <SettingRow label={IMAGE_LABEL_2}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <span style={{ fontSize: 12, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>输出风格</span>
-            <select
-              className="select"
+            <TemplateSelect
               value={config.general.extractShortcut2Template}
-              onChange={e => update({ extractShortcut2Template: e.target.value })}
-              style={{ minWidth: 100 }}
-            >
-              {config.extract.templates.map(t => (
-                <option key={t.id} value={t.id}>{t.name}</option>
-              ))}
-            </select>
+              templates={config.extract.templates}
+              onChange={templateId => update({ extractShortcut2Template: templateId })}
+            />
             <ShortcutInput
               field="extractShortcut2"
               display={formatShortcutDisplay(config.general.extractShortcut2)}

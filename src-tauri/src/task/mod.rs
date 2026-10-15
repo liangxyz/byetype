@@ -154,6 +154,21 @@ struct PipelineFailure {
     transcribe_text: Option<String>,
 }
 
+/// 第二阶段（文本强化模型）要用的模板；返回 None 表示跳过第二阶段。
+/// 只由全局开关决定：关闭时不调用第二个模型。「规则增强」是否在第一阶段注入
+/// 由 inject_text_rules 单独控制，不改变这里的判断。
+fn second_stage_template(
+    strengthening_enabled: bool,
+    triggered_template: Option<&str>,
+) -> Option<String> {
+    if !strengthening_enabled {
+        return None;
+    }
+    triggered_template
+        .filter(|template_id| !template_id.is_empty())
+        .map(str::to_string)
+}
+
 pub async fn run_silent_pipeline(
     app: &AppHandle,
     audio_base64: String,
@@ -458,6 +473,18 @@ async fn execute_pipeline(
         },
     )?;
 
+    // 两个开关互相独立：全局开关只决定第二阶段是否运行；
+    // 规则增强只决定第一阶段是否带上当前模板的强化规则。
+    let injected_text_rules = crate::ai::prompt::resolve_text_rule_injection(
+        &config,
+        &prompts_dir,
+        template_id.as_deref(),
+    );
+    let second_stage = second_stage_template(
+        config.general.text_strengthening_enabled,
+        template_id.as_deref(),
+    );
+
     observer(PipelineEvent::Transcribing);
     let retry_observer = observer.clone();
     let transcribe_started = std::time::Instant::now();
@@ -467,6 +494,7 @@ async fn execute_pipeline(
         let config = config.clone();
         let prompts_dir = prompts_dir.clone();
         let learning_rules = learning_rules.clone();
+        let injected_text_rules = injected_text_rules.clone();
         tokio::select! {
             result = ai::retry::with_retry(
                 || {
@@ -475,6 +503,7 @@ async fn execute_pipeline(
                     let config = config.clone();
                     let prompts_dir = prompts_dir.clone();
                     let learning_rules = learning_rules.clone();
+                    let injected_text_rules = injected_text_rules.clone();
                     async move {
                         ai::transcribe(
                             &client,
@@ -482,6 +511,7 @@ async fn execute_pipeline(
                             &config,
                             &prompts_dir,
                             &learning_rules,
+                            injected_text_rules.as_deref(),
                         )
                         .await
                     }
@@ -502,7 +532,7 @@ async fn execute_pipeline(
     })?;
     let transcribe_ms = transcribe_started.elapsed().as_millis() as u64;
 
-    let Some(template_id) = template_id else {
+    let Some(template_id) = second_stage else {
         return Ok(PipelineOutput {
             final_text: transcribe.text.clone(),
             transcribe_text: transcribe.text,
@@ -1026,5 +1056,24 @@ pub fn submit_screenshot_crop(
 ) {
     if let Some(sender) = sender_state.lock().unwrap().take() {
         let _ = sender.send(crop);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::second_stage_template;
+
+    #[test]
+    fn second_stage_only_follows_global_switch() {
+        // 正常路径：全局开启，跑第二阶段
+        assert_eq!(
+            second_stage_template(true, Some("voice-optimize")),
+            Some("voice-optimize".to_string())
+        );
+        // 全局关闭：不调用第二个模型
+        assert_eq!(second_stage_template(false, Some("voice-optimize")), None);
+        // raw 请求
+        assert_eq!(second_stage_template(true, None), None);
+        assert_eq!(second_stage_template(true, Some("")), None);
     }
 }

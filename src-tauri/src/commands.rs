@@ -77,6 +77,32 @@ pub async fn save_config(
             != old_config.general.extract_shortcut_template
         || config.general.extract_shortcut2_template
             != old_config.general.extract_shortcut2_template;
+    let strengthening_changed = config.general.text_strengthening_enabled
+        != old_config.general.text_strengthening_enabled;
+
+    // 如果用户显式开启文本强化，必须检查当前配置的 shortcut2 是否会与其他快捷键产生冲突。
+    // 如果存在冲突，必须明确报错拒绝，避免静默进入“跳过冲突”状态。
+    if strengthening_changed && config.general.text_strengthening_enabled {
+        let current_config = config_manager.get();
+        let values = crate::shortcut::shortcut_values(&current_config);
+        let normalized = crate::shortcut::normalized_from_values(&values);
+        let graph = crate::shortcut::model::build_conflict_graph(&normalized);
+        if let Some(pair) = graph.pairs.into_iter().next() {
+            let message = match pair.kind {
+                crate::shortcut::model::ConflictKind::Duplicate => format!(
+                    "{} 与 {} 使用了相同的快捷键，请先调整快捷键再开启文本强化",
+                    pair.left.label(),
+                    pair.right.label()
+                ),
+                crate::shortcut::model::ConflictKind::AltPrefix => format!(
+                    "{} 与 {} 存在“右 Alt”前缀冲突，请先调整快捷键再开启文本强化",
+                    pair.left.label(),
+                    pair.right.label()
+                ),
+            };
+            return Err(format!("{}: {}", pair.kind.code(), message));
+        }
+    }
 
     // 用后端已确认的快捷键值构造基础配置，避免前端旧完整快照覆盖快捷键。
     let mut base = config.clone();
@@ -98,8 +124,8 @@ pub async fn save_config(
     if !shortcut_patch.is_empty() {
         // 显式快捷键变更：整次成功或整次回滚。
         crate::shortcut::update_shortcuts(&app, recorder, shortcut_patch)?;
-    } else if templates_changed {
-        // 输出风格变化需要按新模板重新注册。
+    } else if templates_changed || strengthening_changed {
+        // 输出风格或文本强化开关变化需要重新注册。
         crate::shortcut::register(&app, recorder)?;
     }
 

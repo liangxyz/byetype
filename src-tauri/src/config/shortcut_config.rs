@@ -290,7 +290,16 @@ pub fn migrate_shortcuts(
             let mut candidate = normalized_fields(raw);
             candidate[ShortcutField::Shortcut.index()] =
                 NormalizedShortcut::Valid(model::ALT_RIGHT.to_string());
-            if build_conflict_graph(&candidate).has_conflicts() {
+            let strengthening_enabled = raw
+                .get("general")
+                .and_then(|g| g.get("textStrengtheningEnabled"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let mut conflict_candidate = candidate.clone();
+            if !strengthening_enabled {
+                conflict_candidate[ShortcutField::Shortcut2.index()] = NormalizedShortcut::Empty;
+            }
+            if build_conflict_graph(&conflict_candidate).has_conflicts() {
                 outcome.f4_kept_conflict = true;
                 outcome.diagnostics.push(
                     "F4 → AltRight 会产生冲突，保留 F4 并保留其他用户快捷键".to_string(),

@@ -396,11 +396,23 @@ pub fn build_conflict_graph(values: &[NormalizedShortcut; 4]) -> ConflictGraph {
 ///
 /// `changed` marks the fields the user actually edited. Only changed fields are
 /// required to be syntactically valid; unchanged fields keep their existing
-/// (possibly unknown) value. Conflicts are always evaluated across all four
-/// normalized values.
+/// (possibly unknown) value. Conflicts are evaluated across all four normalized values.
+#[allow(dead_code)]
 pub fn validate_candidates(
     values: &[NormalizedShortcut; 4],
     changed: &[bool; 4],
+) -> Result<(), ShortcutValidationError> {
+    validate_candidates_with_active(values, changed, &[true; 4])
+}
+
+/// Validate candidates while respecting an active field mask (e.g. inactive
+/// fields such as `shortcut2` when text strengthening is disabled do not
+/// participate in conflict detection, but explicitly changed fields are still
+/// validated for syntax).
+pub fn validate_candidates_with_active(
+    values: &[NormalizedShortcut; 4],
+    changed: &[bool; 4],
+    active: &[bool; 4],
 ) -> Result<(), ShortcutValidationError> {
     for i in 0..4 {
         if changed[i] {
@@ -414,7 +426,14 @@ pub fn validate_candidates(
         }
     }
 
-    let graph = build_conflict_graph(values);
+    let conflict_values = std::array::from_fn(|i| {
+        if active[i] {
+            values[i].clone()
+        } else {
+            NormalizedShortcut::Empty
+        }
+    });
+    let graph = build_conflict_graph(&conflict_values);
     if let Some(pair) = graph.pairs.first() {
         let message = match pair.kind {
             ConflictKind::Duplicate => format!(
@@ -631,5 +650,45 @@ mod tests {
         let values = [valid("F8"), valid("F8"), NormalizedShortcut::Empty, NormalizedShortcut::Empty];
         let err = validate_candidates(&values, &[true, false, false, false]).unwrap_err();
         assert_eq!(err.code, "SHORTCUT_CONFLICT");
+    }
+
+    #[test]
+    fn validate_respects_active_mask_for_conflicts_but_checks_syntax() {
+        let duplicate_values = [
+            valid("F8"),
+            valid("F8"),
+            NormalizedShortcut::Empty,
+            NormalizedShortcut::Empty,
+        ];
+        // When active[1] is false, duplicate with slot 1 is ignored
+        assert!(validate_candidates_with_active(
+            &duplicate_values,
+            &[true, false, false, false],
+            &[true, false, true, true]
+        )
+        .is_ok());
+
+        // When active[1] is true, duplicate is rejected
+        assert!(validate_candidates_with_active(
+            &duplicate_values,
+            &[true, false, false, false],
+            &[true, true, true, true]
+        )
+        .is_err());
+
+        // Even when active[1] is false, explicitly patching invalid syntax in slot 1 is rejected
+        let invalid_in_inactive_slot = [
+            valid("F8"),
+            NormalizedShortcut::Invalid("BadKey".to_string()),
+            NormalizedShortcut::Empty,
+            NormalizedShortcut::Empty,
+        ];
+        let err = validate_candidates_with_active(
+            &invalid_in_inactive_slot,
+            &[false, true, false, false],
+            &[true, false, true, true],
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "INVALID_SHORTCUT");
     }
 }

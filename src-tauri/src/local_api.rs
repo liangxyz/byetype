@@ -264,6 +264,8 @@ fn text_response(status: StatusCode, body: impl Into<String>) -> Response {
 }
 
 fn resolve_template(config: &AppConfig, requested: Option<&str>) -> Result<Option<String>, String> {
+    // raw 只识别不注入；普通请求（显式模板或默认绑定）始终带上所选模板，
+    // 全局强化开关只在 execute_pipeline 决定是否运行第二阶段。
     match requested {
         Some("raw") => Ok(None),
         Some(template_id)
@@ -276,8 +278,7 @@ fn resolve_template(config: &AppConfig, requested: Option<&str>) -> Result<Optio
             Ok(Some(template_id.to_string()))
         }
         Some(template_id) => Err(format!("未知语音模板：{}", template_id)),
-        None => Ok((!config.general.shortcut_template.is_empty())
-            .then(|| config.general.shortcut_template.clone())),
+        None => Ok(Some(config.general.shortcut_template.clone()).filter(|id| !id.is_empty())),
     }
 }
 
@@ -316,6 +317,30 @@ mod tests {
     fn unknown_template_is_rejected() {
         let config = AppConfig::default();
 
+        assert_eq!(
+            resolve_template(&config, Some("missing")),
+            Err("未知语音模板：missing".to_string())
+        );
+    }
+
+    #[test]
+    fn strengthening_off_keeps_normal_request_templates() {
+        let mut config = AppConfig::default();
+        config.general.text_strengthening_enabled = false;
+
+        // 显式指定模板保留给第一阶段
+        assert_eq!(
+            resolve_template(&config, Some("voice-translate")),
+            Ok(Some("voice-translate".to_string()))
+        );
+        // 未指定模板用主绑定
+        assert_eq!(
+            resolve_template(&config, None),
+            Ok(Some("voice-optimize".to_string()))
+        );
+        // raw 语义不变：只识别
+        assert_eq!(resolve_template(&config, Some("raw")), Ok(None));
+        // 未知模板仍然报错
         assert_eq!(
             resolve_template(&config, Some("missing")),
             Err("未知语音模板：missing".to_string())

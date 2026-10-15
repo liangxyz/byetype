@@ -24,6 +24,8 @@ export interface GeneralConfig {
   extractShortcut2Label?: string
   pttMode?: boolean
   overwriteClipboard?: boolean
+  /** 全局「文本强化」开关。关闭时语音只识别，不调用文本强化模型，第二个语音快捷键也不注册 */
+  textStrengtheningEnabled?: boolean
 }
 
 /** 稀疏快捷键更新：缺失字段表示不修改，显式 "" 表示清空。 */
@@ -108,6 +110,8 @@ export interface TranscribeConfig {
   modelId: string
   thinking: ThinkingConfig
   prompts: { agent: string; rules: string; vocabulary: string }
+  /** 规则增强：将文本规则注入语音规则。识别阶段直接拼接所选文本强化规则，强模型一次处理完 */
+  injectTextRules?: boolean
 }
 
 export interface VoiceLearningConfig {
