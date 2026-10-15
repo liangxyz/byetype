@@ -227,3 +227,81 @@ test('template deletion success preserves newer concurrent edits in latest state
   // Confirmed fallback template was applied!
   assert.strictEqual(liveConfig.general.shortcutTemplate, 'fallback-1')
 })
+
+test('synchronous configRef publication prevents race where edit happens before React effect synchronizes ref', () => {
+  let stateConfig: AppConfig | null = null
+  const configRef = { current: null as AppConfig | null }
+
+  const publishConfig = (next: AppConfig) => {
+    configRef.current = next
+    stateConfig = next
+  }
+
+  const initialConfig: AppConfig = {
+    general: {
+      theme: 'light',
+      microphone: 'mic-1',
+      launchAtLogin: false,
+      shortcut: 'AltRight',
+      shortcut2: '',
+      extractShortcut: 'F6',
+      extractShortcut2: '',
+      shortcutTemplate: 'voice-custom',
+      shortcut2Template: '',
+      extractShortcutTemplate: '',
+      extractShortcut2Template: '',
+      maxRecordingSeconds: 60,
+      overwriteClipboard: true,
+      textStrengtheningEnabled: true,
+    },
+    voiceTemplates: {
+      templates: [
+        { id: 'voice-custom', name: 'Custom' },
+        { id: 'voice-fallback', name: 'Fallback' },
+      ],
+    },
+    models: {} as any,
+    localApi: {} as any,
+    transcribe: {} as any,
+    voiceLearning: {} as any,
+    extract: { templates: [] },
+    advanced: {} as any,
+  }
+
+  publishConfig(initialConfig)
+
+  // Synchronous edit occurs before any effect
+  const editedConfig: AppConfig = {
+    ...configRef.current!,
+    general: { ...configRef.current!.general, theme: 'dark' },
+  }
+  publishConfig(editedConfig)
+
+  // Immediate deletion completion uses synchronous configRef.current
+  const latestBeforeDeletion = configRef.current!
+  assert.strictEqual(latestBeforeDeletion.general.theme, 'dark')
+
+  const updatedAfterDeletion = applyTemplateDeletionCompletion(latestBeforeDeletion, {
+    kind: 'voice',
+    deletedId: 'voice-custom',
+    confirmedDomain: {
+      shortcut: 'AltRight',
+      shortcut2: '',
+      extractShortcut: 'F6',
+      extractShortcut2: '',
+      shortcutTemplate: 'voice-fallback',
+      shortcut2Template: '',
+      extractShortcutTemplate: '',
+      extractShortcut2Template: '',
+      textStrengtheningEnabled: true,
+      altRightBackend: 'raw_input',
+      perField: [],
+    },
+  })
+  publishConfig(updatedAfterDeletion)
+
+  assert.strictEqual(configRef.current!.general.theme, 'dark')
+  assert.strictEqual(configRef.current!.general.shortcutTemplate, 'voice-fallback')
+  assert.strictEqual(configRef.current!.voiceTemplates.templates.length, 1)
+  assert.strictEqual(stateConfig!.general.theme, 'dark')
+})

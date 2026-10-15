@@ -54,9 +54,11 @@ export function App() {
   const [activeTab, setActiveTab] = useState('general')
   const [config, setConfig] = useState<AppConfig | null>(null)
   const configRef = useRef<AppConfig | null>(null)
-  useEffect(() => {
-    configRef.current = config
-  }, [config])
+
+  const publishConfig = useCallback((next: AppConfig) => {
+    configRef.current = next
+    setConfig(next)
+  }, [])
   const [saved, setSaved] = useState(false)
   const [errorMsg, setErrorMsg] = useState('')
   const [updateState, setUpdateState] = useState<UpdateState>(INITIAL_UPDATE_STATE)
@@ -69,7 +71,7 @@ export function App() {
 
   useEffect(() => {
     let cancelled = false
-    getConfig().then((c) => { if (!cancelled) setConfig(c) })
+    getConfig().then((c) => { if (!cancelled) publishConfig(c) })
     getVersion().then((v) => { if (!cancelled) setAppVersion(v) })
 
     let unsubUpdateAvailable: (() => void) | null = null
@@ -167,7 +169,7 @@ export function App() {
   }, [config, activeTab])
 
   const handleSave = useCallback((newConfig: AppConfig) => {
-    setConfig(newConfig)
+    publishConfig(newConfig)
     if (debounceRef.current) clearTimeout(debounceRef.current)
     debounceRef.current = setTimeout(async () => {
       try {
@@ -177,20 +179,23 @@ export function App() {
       } catch (e: any) {
         const msg = typeof e === 'string' ? e : e?.message || '保存失败'
         setErrorMsg(msg)
-        getConfig().then(setConfig).catch(() => {})
+        getConfig().then(publishConfig).catch(() => {})
         setTimeout(() => setErrorMsg(''), 4000)
       }
     }, 300)
-  }, [])
+  }, [publishConfig])
 
   const showShortcutResult = useCallback((result: ShortcutUpdateResult) => {
-    setConfig(prev => prev ? {
-      ...prev,
-      general: mergeConfirmedShortcutDomain(prev.general, result),
-    } : prev)
+    const latest = configRef.current
+    if (!latest) return
+    const updated = {
+      ...latest,
+      general: mergeConfirmedShortcutDomain(latest.general, result),
+    }
+    publishConfig(updated)
     setSaved(true)
     setTimeout(() => setSaved(false), 1500)
-  }, [])
+  }, [publishConfig])
 
   // Shortcut changes use the backend's dedicated field-level update path and
   // are never written through the full AppConfig snapshot.
@@ -202,10 +207,10 @@ export function App() {
       const msg = typeof e === 'string' ? e : e?.message || '保存快捷键失败'
       setErrorMsg(msg)
       setTimeout(() => setErrorMsg(''), 4000)
-      getConfig().then(setConfig).catch(() => {})
+      getConfig().then(publishConfig).catch(() => {})
       throw e
     }
-  }, [showShortcutResult])
+  }, [publishConfig, showShortcutResult])
 
   const handleResetShortcuts = useCallback(async () => {
     try {
@@ -215,10 +220,10 @@ export function App() {
       const msg = typeof e === 'string' ? e : e?.message || '恢复默认快捷键失败'
       setErrorMsg(msg)
       setTimeout(() => setErrorMsg(''), 4000)
-      getConfig().then(setConfig).catch(() => {})
+      getConfig().then(publishConfig).catch(() => {})
       throw e
     }
-  }, [showShortcutResult])
+  }, [publishConfig, showShortcutResult])
 
   const handleTemplateDelete = useCallback((
     kind: 'voice' | 'image',
@@ -232,7 +237,6 @@ export function App() {
       deletedId,
       confirmedDomain,
     })
-    setConfig(updated)
     handleSave(updated)
   }, [handleSave])
 

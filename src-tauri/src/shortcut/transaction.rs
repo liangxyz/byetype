@@ -324,8 +324,16 @@ pub fn perform_targeted_cleanup<F>(
 where
     F: FnMut(&str) -> Result<(), String>,
 {
+    // Filter to keys currently pending in the ledger.
+    // Retrying already-removed keys causes Windows UnregisterHotKey to fail with ERROR_HOTKEY_NOT_REGISTERED.
+    let pending_keys: Vec<String> = keys_to_clean
+        .iter()
+        .filter(|k| owned_ledger.contains(*k))
+        .cloned()
+        .collect();
+
     let mut errors = Vec::new();
-    for key in keys_to_clean {
+    for key in &pending_keys {
         match unregister_key_fn(key) {
             Ok(()) => {
                 owned_ledger.remove(key);
@@ -1421,6 +1429,10 @@ mod tests {
 
         impl ThreeLayerPluginFake {
             fn unregister_key(&mut self, key: &str) -> Result<(), String> {
+                // Real Windows UnregisterHotKey: returns 0 if hotkey is not currently registered in OS
+                if !self.os_registrations.contains(key) {
+                    return Err(format!("Windows ERROR_HOTKEY_NOT_REGISTERED: {key}"));
+                }
                 if self.fail_keys.contains(key) {
                     Err(format!("OS failure unregistering {key}"))
                 } else {

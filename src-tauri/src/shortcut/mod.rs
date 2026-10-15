@@ -476,24 +476,36 @@ impl ShortcutManager {
     fn teardown_keys(&self, app: &AppHandle, keys: &[String]) -> Result<(), String> {
         let backend = {
             let mut inner = self.lock_inner();
+            inner.pressed = [false; 4];
             inner.alt_right_backend.take()
         };
         if let Some(mut backend) = backend {
             backend.stop();
         }
 
-        let mut inner = self.lock_inner();
-        inner.pressed = [false; 4];
+        // Snapshot ledger under lock, then release inner to avoid main-thread deadlocks.
+        let mut ledger_snapshot = {
+            let inner = self.lock_inner();
+            inner.owned_hotkeys.clone()
+        };
 
-        transaction::perform_targeted_cleanup(
+        let res = transaction::perform_targeted_cleanup(
             keys,
-            &mut inner.owned_hotkeys,
+            &mut ledger_snapshot,
             |key| {
                 app.global_shortcut()
                     .unregister(key)
                     .map_err(|e| format!("{e}"))
             },
-        )
+        );
+
+        // Reacquire inner briefly to update the ledger with confirmed unregistrations.
+        {
+            let mut inner = self.lock_inner();
+            inner.owned_hotkeys = ledger_snapshot;
+        }
+
+        res
     }
 
     fn perform_registration(
