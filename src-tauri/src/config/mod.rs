@@ -10,7 +10,7 @@ use types::AppConfig;
 
 use shortcut_config::{
     merge_config_preserving_shortcuts, migrate_shortcuts, sanitized_for_deserialize, schema_mode,
-    set_field, ShortcutSchemaMode,
+    ShortcutSchemaMode,
 };
 
 struct ConfigState {
@@ -209,19 +209,18 @@ impl ConfigManager {
         Ok(())
     }
 
-    /// Persist a field-level shortcut patch on top of the latest raw JSON.
+    /// Persist a shortcut domain patch (keys, templates, textStrengtheningEnabled)
+    /// on top of the latest raw JSON.
     ///
-    /// This is the only path that may change shortcut values. It preserves all
+    /// This is the only path that may change shortcut-domain values. It preserves all
     /// other fields, unknown keys and the (possibly higher) schema marker.
-    pub fn commit_shortcut_patch(
+    pub fn commit_shortcut_domain_patch(
         &self,
-        patch: &[(crate::shortcut::model::ShortcutField, String)],
+        persist: &shortcut_config::ShortcutDomainPersist,
     ) -> Result<AppConfig, String> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut candidate = state.raw.clone();
-        for (field, value) in patch {
-            set_field(&mut candidate, *field, value)?;
-        }
+        shortcut_config::apply_shortcut_domain_persist(&mut candidate, persist)?;
         let view = deserialize_config(&candidate);
         atomic_write_value(&self.config_path, &candidate).map_err(|e| {
             format!("CONFIG_PERSIST_FAILED: {}", e)
@@ -229,6 +228,19 @@ impl ConfigManager {
         state.raw = candidate;
         state.config = view.clone();
         Ok(view)
+    }
+
+    /// Backwards compatibility helper for key-only persistence.
+    #[allow(dead_code)]
+    pub fn commit_shortcut_patch(
+        &self,
+        patch: &[(crate::shortcut::model::ShortcutField, String)],
+    ) -> Result<AppConfig, String> {
+        let persist = shortcut_config::ShortcutDomainPersist {
+            keys: patch.to_vec(),
+            ..Default::default()
+        };
+        self.commit_shortcut_domain_patch(&persist)
     }
 }
 

@@ -144,20 +144,75 @@ fn merge_value(target: &mut Value, incoming: Value) {
     }
 }
 
+/// All keys within `general` that belong to the shortcut domain and must be
+/// protected from being overwritten by general config snapshots.
+pub const SHORTCUT_DOMAIN_KEYS: &[&str] = &[
+    SCHEMA_VERSION_KEY,
+    "shortcut",
+    "shortcut2",
+    "extractShortcut",
+    "extractShortcut2",
+    "shortcutTemplate",
+    "shortcut2Template",
+    "extractShortcutTemplate",
+    "extractShortcut2Template",
+    "textStrengtheningEnabled",
+];
+
+/// A sparse persistence bundle for the shortcut domain.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShortcutDomainPersist {
+    pub keys: Vec<(ShortcutField, String)>,
+    pub templates: Vec<(ShortcutField, String)>,
+    pub text_strengthening_enabled: Option<bool>,
+}
+
+impl ShortcutDomainPersist {
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+            && self.templates.is_empty()
+            && self.text_strengthening_enabled.is_none()
+    }
+}
+
+/// Apply a shortcut domain persistence bundle directly to the raw JSON Value.
+pub fn apply_shortcut_domain_persist(
+    raw: &mut Value,
+    persist: &ShortcutDomainPersist,
+) -> Result<(), String> {
+    let general = ensure_general_object(raw)?;
+    for (field, value) in &persist.keys {
+        general.insert(field.key().to_string(), Value::String(value.clone()));
+    }
+    for (field, value) in &persist.templates {
+        let template_key = match field {
+            ShortcutField::Shortcut => "shortcutTemplate",
+            ShortcutField::Shortcut2 => "shortcut2Template",
+            ShortcutField::ExtractShortcut => "extractShortcutTemplate",
+            ShortcutField::ExtractShortcut2 => "extractShortcut2Template",
+        };
+        general.insert(template_key.to_string(), Value::String(value.clone()));
+    }
+    if let Some(enabled) = persist.text_strengthening_enabled {
+        general.insert("textStrengtheningEnabled".to_string(), Value::Bool(enabled));
+    }
+    Ok(())
+}
+
 /// Merge a serialized `AppConfig` into the latest raw JSON.
 ///
-/// The four shortcut fields and the shortcut schema marker are *always* taken
-/// from `raw` (the authoritative latest persisted state); they are only ever
-/// changed through the shortcut-specific update path. This prevents a stale
-/// frontend `AppConfig` snapshot from overwriting shortcuts or downgrading a
-/// higher schema.
+/// All shortcut-domain fields (keys, templates, textStrengtheningEnabled and
+/// schema version) are *always* preserved from `raw` (the authoritative latest
+/// persisted state); they are only ever changed through the shortcut-specific
+/// update path. This prevents a stale frontend `AppConfig` snapshot from
+/// overwriting shortcuts or downgrading a higher schema.
 pub fn merge_config_preserving_shortcuts(raw: &mut Value, incoming: Value) {
-    let protected: Vec<(String, Option<Value>)> = std::iter::once(SCHEMA_VERSION_KEY.to_string())
-        .chain(ShortcutField::ALL.iter().map(|field| field.key().to_string()))
-        .map(|key| {
+    let protected: Vec<(&str, Option<Value>)> = SHORTCUT_DOMAIN_KEYS
+        .iter()
+        .map(|&key| {
             let value = raw
                 .get("general")
-                .and_then(|general| general.get(&key))
+                .and_then(|general| general.get(key))
                 .cloned();
             (key, value)
         })
@@ -169,10 +224,10 @@ pub fn merge_config_preserving_shortcuts(raw: &mut Value, incoming: Value) {
         for (key, value) in protected {
             match value {
                 Some(value) => {
-                    general.insert(key, value);
+                    general.insert(key.to_string(), value);
                 }
                 None => {
-                    general.remove(&key);
+                    general.remove(key);
                 }
             }
         }
@@ -564,38 +619,109 @@ mod tests {
             }
         });
 
-        // 1. User disables text strengthening
-        let incoming_disable = json!({
-            "general": {
-                "textStrengtheningEnabled": false
-            }
-        });
-        merge_config_preserving_shortcuts(&mut raw, incoming_disable);
+        // 1. User disables text strengthening via shortcut domain patch
+        let persist_disable = ShortcutDomainPersist {
+            text_strengthening_enabled: Some(false),
+            ..Default::default()
+        };
+        apply_shortcut_domain_persist(&mut raw, &persist_disable).unwrap();
         assert_eq!(raw["general"]["shortcut2"], "F8");
         assert_eq!(raw["general"]["textStrengtheningEnabled"], false);
 
-        // 2. User updates non-shortcut and shortcut settings while disabled
+        // 2. User updates non-shortcut settings; domain fields are protected
         let incoming_theme = json!({
             "general": {
-                "theme": "dark"
+                "theme": "dark",
+                "textStrengtheningEnabled": true, // Stale frontend snapshot tries to overwrite
+                "shortcut2": "ShouldNotOverwrite"
             }
         });
         merge_config_preserving_shortcuts(&mut raw, incoming_theme);
         assert_eq!(raw["general"]["shortcut2"], "F8");
+        assert_eq!(raw["general"]["textStrengtheningEnabled"], false);
+        assert_eq!(raw["general"]["theme"], "dark");
 
         // 3. Simulated restart: migration runs, shortcut2 is preserved
         let outcome = migrate_shortcuts(&mut raw, true, false);
         assert_eq!(raw["general"]["shortcut2"], "F8");
         assert!(!outcome.changed);
 
-        // 4. User re-enables text strengthening
-        let incoming_reenable = json!({
-            "general": {
-                "textStrengtheningEnabled": true
-            }
-        });
-        merge_config_preserving_shortcuts(&mut raw, incoming_reenable);
+        // 4. User re-enables text strengthening via shortcut domain patch
+        let persist_reenable = ShortcutDomainPersist {
+            text_strengthening_enabled: Some(true),
+            ..Default::default()
+        };
+        apply_shortcut_domain_persist(&mut raw, &persist_reenable).unwrap();
         assert_eq!(raw["general"]["shortcut2"], "F8");
         assert_eq!(raw["general"]["textStrengtheningEnabled"], true);
+    }
+
+    #[test]
+    fn migration_with_strengthening_disabled_preserves_stored_secondary_value() {
+        // Windows schema < 1 with F4 and secondary Alt+A (would conflict if enabled)
+        let mut raw = json!({
+            "general": {
+                "shortcut": "F4",
+                "shortcut2": "Alt+A",
+                "extractShortcut": "F6",
+                "extractShortcut2": "",
+                "textStrengtheningEnabled": false
+            }
+        });
+
+        let outcome = migrate_shortcuts(&mut raw, true, true);
+        // F4 -> AltRight succeeds because inactive shortcut2 is masked from conflict check
+        assert_eq!(general_shortcut(&raw), Some("AltRight"));
+        assert!(outcome.f4_replaced);
+        assert!(!outcome.f4_kept_conflict);
+        // Stored shortcut2 remains Alt+A untouched
+        assert_eq!(raw["general"]["shortcut2"], "Alt+A");
+    }
+
+    #[test]
+    fn migration_with_strengthening_disabled_and_secondary_alt_right() {
+        // Windows schema < 1 with F4 and secondary AltRight
+        let mut raw = json!({
+            "general": {
+                "shortcut": "F4",
+                "shortcut2": "AltRight",
+                "extractShortcut": "F6",
+                "extractShortcut2": "",
+                "textStrengtheningEnabled": false
+            }
+        });
+
+        let outcome = migrate_shortcuts(&mut raw, true, true);
+        assert_eq!(general_shortcut(&raw), Some("AltRight"));
+        assert!(outcome.f4_replaced);
+        assert!(!outcome.f4_kept_conflict);
+        assert_eq!(raw["general"]["shortcut2"], "AltRight");
+    }
+
+    #[test]
+    fn merge_preserving_shortcuts_protects_templates_and_strengthening() {
+        let mut raw = json!({
+            "general": {
+                "shortcut": "AltRight",
+                "shortcutTemplate": "tpl-1",
+                "textStrengtheningEnabled": false,
+                SCHEMA_VERSION_KEY: 1
+            }
+        });
+        let incoming = json!({
+            "general": {
+                "shortcut": "F4",
+                "shortcutTemplate": "tpl-stale",
+                "textStrengtheningEnabled": true,
+                "theme": "dark"
+            }
+        });
+        merge_config_preserving_shortcuts(&mut raw, incoming);
+        // Protected domain fields are untouched
+        assert_eq!(raw["general"]["shortcut"], "AltRight");
+        assert_eq!(raw["general"]["shortcutTemplate"], "tpl-1");
+        assert_eq!(raw["general"]["textStrengtheningEnabled"], false);
+        // Non-shortcut field was updated
+        assert_eq!(raw["general"]["theme"], "dark");
     }
 }

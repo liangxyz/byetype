@@ -57,8 +57,8 @@ pub async fn save_config(
     let old_config = config_manager.get();
     let recorder = recorder.inner().clone();
 
-    // 快捷键域走专属字段级更新路径；完整配置序列化不得覆盖快捷键字段。
-    let shortcut_patch = crate::shortcut::ShortcutPatch {
+    // 1. 构建快捷键域补丁（只包含确实变动的部分）
+    let domain_patch = crate::shortcut::ShortcutDomainPatch {
         shortcut: (config.general.shortcut != old_config.general.shortcut)
             .then(|| config.general.shortcut.clone()),
         shortcut2: (config.general.shortcut2 != old_config.general.shortcut2)
@@ -69,88 +69,30 @@ pub async fn save_config(
             config.general.extract_shortcut2 != old_config.general.extract_shortcut2
         )
         .then(|| config.general.extract_shortcut2.clone()),
+        shortcut_template: (config.general.shortcut_template != old_config.general.shortcut_template)
+            .then(|| config.general.shortcut_template.clone()),
+        shortcut2_template: (config.general.shortcut2_template != old_config.general.shortcut2_template)
+            .then(|| config.general.shortcut2_template.clone()),
+        extract_shortcut_template: (config.general.extract_shortcut_template != old_config.general.extract_shortcut_template)
+            .then(|| config.general.extract_shortcut_template.clone()),
+        extract_shortcut2_template: (config.general.extract_shortcut2_template != old_config.general.extract_shortcut2_template)
+            .then(|| config.general.extract_shortcut2_template.clone()),
+        text_strengthening_enabled: (config.general.text_strengthening_enabled != old_config.general.text_strengthening_enabled)
+            .then_some(config.general.text_strengthening_enabled),
     };
-    let templates = [
-        config.general.shortcut_template.clone(),
-        config.general.shortcut2_template.clone(),
-        config.general.extract_shortcut_template.clone(),
-        config.general.extract_shortcut2_template.clone(),
-    ];
-    let templates_changed = config.general.shortcut_template
-        != old_config.general.shortcut_template
-        || config.general.shortcut2_template != old_config.general.shortcut2_template
-        || config.general.extract_shortcut_template
-            != old_config.general.extract_shortcut_template
-        || config.general.extract_shortcut2_template
-            != old_config.general.extract_shortcut2_template;
-    let strengthening_changed = config.general.text_strengthening_enabled
-        != old_config.general.text_strengthening_enabled;
-    let shortcuts_need_update =
-        !shortcut_patch.is_empty() || templates_changed || strengthening_changed;
 
-    // 1. 如果快捷键、模板或文本强化开关有变动，先通过严格路径校验并执行运行时切换（带完整回滚保证）。
-    // 在快捷键域完全成功之前，严禁提前将 textStrengtheningEnabled 或快捷键改动写盘。
-    if shortcuts_need_update {
-        crate::shortcut::update_shortcut_settings(
-            &app,
-            &recorder,
-            &shortcut_patch,
-            &templates,
-            config.general.text_strengthening_enabled,
-        )?;
+    // 2. 如果快捷键域有变动，在领域锁内完成严格切换与原子写盘（包括键位、模板及强化开关）
+    if !domain_patch.is_empty() {
+        crate::shortcut::update_shortcut_settings(&app, &recorder, &domain_patch)?;
     }
 
-    // 2. 用后端已确认的快捷键值构造基础配置，保存非快捷键配置。
-    let confirmed_config = config_manager.get();
-    let mut base = config.clone();
-    base.general.shortcut = confirmed_config.general.shortcut;
-    base.general.shortcut2 = confirmed_config.general.shortcut2;
-    base.general.extract_shortcut = confirmed_config.general.extract_shortcut;
-    base.general.extract_shortcut2 = confirmed_config.general.extract_shortcut2;
-
+    // 3. 保存非快捷键配置（Local API 与其他通用设置）
     local_api_manager
         .configure(app.clone(), &config.local_api)
         .await?;
-    if let Err(error) = config_manager.update(base) {
-        let _ = local_api_manager
-            .configure(app.clone(), &old_config.local_api)
-            .await;
-        // 如果非快捷键配置写盘失败，且前面发生过快捷键变更，补偿回滚快捷键域
-        if shortcuts_need_update {
-            let rollback_templates = [
-                old_config.general.shortcut_template.clone(),
-                old_config.general.shortcut2_template.clone(),
-                old_config.general.extract_shortcut_template.clone(),
-                old_config.general.extract_shortcut2_template.clone(),
-            ];
-            let rollback_patch = crate::shortcut::ShortcutPatch {
-                shortcut: shortcut_patch
-                    .shortcut
-                    .is_some()
-                    .then(|| old_config.general.shortcut.clone()),
-                shortcut2: shortcut_patch
-                    .shortcut2
-                    .is_some()
-                    .then(|| old_config.general.shortcut2.clone()),
-                extract_shortcut: shortcut_patch
-                    .extract_shortcut
-                    .is_some()
-                    .then(|| old_config.general.extract_shortcut.clone()),
-                extract_shortcut2: shortcut_patch
-                    .extract_shortcut2
-                    .is_some()
-                    .then(|| old_config.general.extract_shortcut2.clone()),
-            };
-            let _ = crate::shortcut::update_shortcut_settings(
-                &app,
-                &recorder,
-                &rollback_patch,
-                &rollback_templates,
-                old_config.general.text_strengthening_enabled,
-            );
-        }
-        return Err(error);
-    }
+
+    // ConfigManager::update 受 SHORTCUT_DOMAIN_KEYS 保护，绝不会覆盖快捷键、模板与强化开关
+    config_manager.update(config)?;
 
     Ok(true)
 }
@@ -178,13 +120,16 @@ pub fn reset_shortcuts(
     app: tauri::AppHandle,
     recorder: State<'_, Arc<AudioRecorder>>,
 ) -> Result<crate::shortcut::ShortcutUpdateResult, String> {
-    let patch = crate::shortcut::ShortcutPatch {
-        shortcut: Some(crate::shortcut::default_primary_shortcut()),
+    let recorder = recorder.inner().clone();
+    let default_shortcut = crate::shortcut::default_primary_shortcut();
+    let patch = crate::shortcut::ShortcutDomainPatch {
+        shortcut: Some(default_shortcut),
         shortcut2: Some(String::new()),
         extract_shortcut: Some("F6".to_string()),
         extract_shortcut2: Some(String::new()),
+        ..Default::default()
     };
-    crate::shortcut::update_shortcuts(&app, recorder.inner().clone(), patch)
+    crate::shortcut::update_shortcut_settings(&app, &recorder, &patch)
 }
 
 fn parse_shortcut_field(field: &str) -> Result<crate::shortcut::ShortcutField, String> {

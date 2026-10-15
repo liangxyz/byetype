@@ -43,10 +43,10 @@ const CAPTURE_MAX_AGE: Duration = Duration::from_secs(120);
 
 // ==================== Public request/response types ====================
 
-/// Sparse shortcut patch. `None` = do not touch; `Some("")` = clear.
+/// Sparse shortcut-domain patch. `None` = do not touch; `Some("")` = clear.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ShortcutPatch {
+pub struct ShortcutDomainPatch {
     #[serde(default)]
     pub shortcut: Option<String>,
     #[serde(default)]
@@ -55,16 +55,33 @@ pub struct ShortcutPatch {
     pub extract_shortcut: Option<String>,
     #[serde(default)]
     pub extract_shortcut2: Option<String>,
+    #[serde(default)]
+    pub shortcut_template: Option<String>,
+    #[serde(default)]
+    pub shortcut2_template: Option<String>,
+    #[serde(default)]
+    pub extract_shortcut_template: Option<String>,
+    #[serde(default)]
+    pub extract_shortcut2_template: Option<String>,
+    #[serde(default)]
+    pub text_strengthening_enabled: Option<bool>,
 }
 
-impl ShortcutPatch {
+impl ShortcutDomainPatch {
     pub fn is_empty(&self) -> bool {
         self.shortcut.is_none()
             && self.shortcut2.is_none()
             && self.extract_shortcut.is_none()
             && self.extract_shortcut2.is_none()
+            && self.shortcut_template.is_none()
+            && self.shortcut2_template.is_none()
+            && self.extract_shortcut_template.is_none()
+            && self.extract_shortcut2_template.is_none()
+            && self.text_strengthening_enabled.is_none()
     }
 }
+
+pub type ShortcutPatch = ShortcutDomainPatch;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -105,8 +122,8 @@ pub struct ShortcutStatus {
 
 // ==================== Internal state ====================
 
-#[derive(Clone)]
-struct FieldRuntime {
+#[derive(Debug, Clone)]
+pub(crate) struct FieldRuntime {
     field: ShortcutField,
     /// Persisted value (canonical for fields changed by the backend).
     value: String,
@@ -180,7 +197,8 @@ enum DispatchMsg {
     },
 }
 
-struct RegistrationResult {
+#[derive(Debug)]
+pub(crate) struct RegistrationResult {
     registered: [bool; 4],
     backend: Option<native::AltRightBackend>,
     backend_kind: Option<BackendKind>,
@@ -673,53 +691,24 @@ impl ShortcutManager {
         &self,
         app: &AppHandle,
         recorder: &Arc<AudioRecorder>,
-        patch: &ShortcutPatch,
-        templates: &[String; 4],
-        text_strengthening_enabled: bool,
+        patch: &ShortcutDomainPatch,
     ) -> Result<ShortcutUpdateResult, String> {
         self.ensure_dispatcher(app, recorder);
         let _guard = self.lock_update();
 
         let config_manager = app.state::<ConfigManager>();
         let current = config_manager.get();
-        let mut values = shortcut_values(&current);
-        let mut changed = [false; 4];
+        let current_values = shortcut_values(&current);
+        let current_templates = shortcut_templates(&current);
+        let current_strengthening = current.general.text_strengthening_enabled;
 
-        apply_patch_to_values(&mut values, &mut changed, patch);
-
-        let normalized = normalized_from_values(&values);
-        let active = [true, text_strengthening_enabled, true, true];
-
-        // Newly activated fields must have valid syntax even if their string was not patched.
-        let newly_activated =
-            !current.general.text_strengthening_enabled && text_strengthening_enabled;
-        let syntax_check_mask = [
-            changed[0],
-            changed[1] || newly_activated,
-            changed[2],
-            changed[3],
-        ];
-
-        model::validate_candidates_with_active(&normalized, &syntax_check_mask, &active).map_err(
-            |error| format!("{}: {}", error.code, error.message),
+        let plan = plan_shortcut_transaction(
+            &current_values,
+            &current_templates,
+            current_strengthening,
+            patch,
+            is_windows(),
         )?;
-
-        // On platforms without a native right-Alt backend an explicit AltRight
-        // save or activation must fail rather than silently persist an unregistered value.
-        #[cfg(not(target_os = "windows"))]
-        for index in 0..4 {
-            if (changed[index] || (index == 1 && newly_activated))
-                && normalized[index].canonical() == Some(ALT_RIGHT)
-            {
-                return Err(
-                    "ALT_RIGHT_BACKEND_FAILED: 当前平台不支持右 Alt 快捷键".to_string(),
-                );
-            }
-        }
-
-        let conflict_candidates = model::effective_conflict_candidates(&normalized, &active);
-        let graph = build_conflict_graph(&conflict_candidates);
-        let fields = build_fields(&values, &normalized, &graph, templates, &active);
 
         let old_fields = { self.lock_inner().runtime.clone() };
 
@@ -727,68 +716,34 @@ impl ShortcutManager {
             let mut inner = self.lock_inner();
             inner.switching = true;
         }
-        self.teardown(app);
-        let mut result = self.perform_registration(app, &fields);
 
-        if !result.errors.is_empty() {
-            // Stop any partially-created native backend before rolling back.
-            if let Some(mut backend) = result.backend.take() {
-                backend.stop();
-            }
-            // Roll back to the previously confirmed runtime.
-            self.teardown(app);
-            let rollback = self.perform_registration(app, &old_fields);
-            {
-                let mut inner = self.lock_inner();
-                inner.alt_right_backend = rollback.backend;
-                inner.backend_kind = rollback.backend_kind;
-                inner.switching = false;
-            }
-            if !rollback.errors.is_empty() {
-                eprintln!("[shortcut] 回滚失败: {:?}", rollback.errors);
-                return Err(format!(
-                    "SHORTCUT_ROLLBACK_FAILED: 新注册失败: {}; 回滚失败: {}",
-                    result.errors.join("; "),
-                    rollback.errors.join("; ")
-                ));
-            }
-            return Err(format!(
-                "SHORTCUT_REGISTER_FAILED: {}",
-                result.errors.join("; ")
-            ));
-        }
-
-        // Persist only the fields the user actually changed in the shortcut patch.
-        let persist = build_persist_patch(&normalized, &changed);
-        if !persist.is_empty() {
-            if let Err(error) = config_manager.commit_shortcut_patch(&persist) {
-                if let Some(mut backend) = result.backend.take() {
+        let result = execute_transaction_workflow(
+            &plan,
+            &old_fields,
+            |fields| self.perform_registration(app, fields),
+            || self.teardown(app),
+            |persist| config_manager.commit_shortcut_domain_patch(persist).map(|_| ()),
+            |backend_opt| {
+                if let Some(mut backend) = backend_opt.take() {
                     backend.stop();
                 }
-                self.teardown(app);
-                let rollback = self.perform_registration(app, &old_fields);
-                {
-                    let mut inner = self.lock_inner();
-                    inner.alt_right_backend = rollback.backend;
-                    inner.backend_kind = rollback.backend_kind;
-                    inner.switching = false;
-                }
-                if !rollback.errors.is_empty() {
-                    return Err(format!(
-                        "SHORTCUT_ROLLBACK_FAILED: 写盘失败后回滚失败: {}; {}",
-                        error,
-                        rollback.errors.join("; ")
-                    ));
-                }
-                return Err(error);
+            },
+        );
+
+        let result = match result {
+            Ok(res) => res,
+            Err(e) => {
+                let mut inner = self.lock_inner();
+                inner.switching = false;
+                return Err(e);
             }
-        }
+        };
 
         let backend_kind = result.backend_kind;
-        self.commit_runtime(fields.clone(), result);
+        self.commit_runtime(plan.fields.clone(), result);
         self.log_registration(app, "update");
 
-        Ok(build_update_result(&fields, &normalized, backend_kind, &persist))
+        Ok(build_update_result(&plan.fields, &plan.normalized, backend_kind, &plan.persist.keys))
     }
 }
 
@@ -818,30 +773,21 @@ pub fn register(app: &AppHandle, recorder: Arc<AudioRecorder>) -> Result<(), Str
 pub fn update_shortcuts(
     app: &AppHandle,
     recorder: Arc<AudioRecorder>,
-    patch: ShortcutPatch,
+    patch: ShortcutDomainPatch,
 ) -> Result<ShortcutUpdateResult, String> {
-    let current = app.state::<ConfigManager>().get();
-    let templates = shortcut_templates(&current);
-    update_shortcut_settings(
-        app,
-        &recorder,
-        &patch,
-        &templates,
-        current.general.text_strengthening_enabled,
-    )
+    update_shortcut_settings(app, &recorder, &patch)
 }
 
 /// Explicit shortcut-domain settings update (keys, templates, strengthening).
-/// Operates under the domain lock with full validation and atomic rollback.
+/// Operates wholly under the domain lock with full candidate validation and
+/// atomic registration and persistence rollback.
 pub fn update_shortcut_settings(
     app: &AppHandle,
     recorder: &Arc<AudioRecorder>,
-    patch: &ShortcutPatch,
-    templates: &[String; 4],
-    text_strengthening_enabled: bool,
+    patch: &ShortcutDomainPatch,
 ) -> Result<ShortcutUpdateResult, String> {
     let manager = app.state::<ShortcutManager>();
-    manager.update_shortcut_settings(app, recorder, patch, templates, text_strengthening_enabled)
+    manager.update_shortcut_settings(app, recorder, patch)
 }
 
 /// Platform default for 语音输入 1, used by the "reset shortcuts" action.
@@ -910,23 +856,166 @@ pub(crate) fn normalized_from_values(values: &[String; 4]) -> [NormalizedShortcu
     std::array::from_fn(|i| model::normalize(&values[i]))
 }
 
-fn apply_patch_to_values(
-    values: &mut [String; 4],
-    changed: &mut [bool; 4],
-    patch: &ShortcutPatch,
-) {
-    let entries: [Option<&String>; 4] = [
+#[derive(Debug, Clone)]
+pub(crate) struct TransactionPlan {
+    pub values: [String; 4],
+    pub templates: [String; 4],
+    pub normalized: [NormalizedShortcut; 4],
+    pub target_strengthening: bool,
+    pub active: [bool; 4],
+    pub fields: [FieldRuntime; 4],
+    pub persist: crate::config::shortcut_config::ShortcutDomainPersist,
+}
+
+pub fn plan_shortcut_transaction(
+    current_values: &[String; 4],
+    current_templates: &[String; 4],
+    current_strengthening: bool,
+    patch: &ShortcutDomainPatch,
+    is_windows: bool,
+) -> Result<TransactionPlan, String> {
+    let mut values = current_values.clone();
+    let mut key_changed = [false; 4];
+    let key_entries: [Option<&String>; 4] = [
         patch.shortcut.as_ref(),
         patch.shortcut2.as_ref(),
         patch.extract_shortcut.as_ref(),
         patch.extract_shortcut2.as_ref(),
     ];
-    for (index, value) in entries.into_iter().enumerate() {
-        if let Some(value) = value {
-            values[index] = value.clone();
-            changed[index] = true;
+    for (i, opt) in key_entries.into_iter().enumerate() {
+        if let Some(val) = opt {
+            values[i] = val.clone();
+            key_changed[i] = true;
         }
     }
+
+    let mut templates = current_templates.clone();
+    let mut template_changed = [false; 4];
+    let template_entries: [Option<&String>; 4] = [
+        patch.shortcut_template.as_ref(),
+        patch.shortcut2_template.as_ref(),
+        patch.extract_shortcut_template.as_ref(),
+        patch.extract_shortcut2_template.as_ref(),
+    ];
+    for (i, opt) in template_entries.into_iter().enumerate() {
+        if let Some(val) = opt {
+            templates[i] = val.clone();
+            template_changed[i] = true;
+        }
+    }
+
+    let target_strengthening = patch
+        .text_strengthening_enabled
+        .unwrap_or(current_strengthening);
+    let strengthening_changed = patch.text_strengthening_enabled.is_some()
+        && patch.text_strengthening_enabled != Some(current_strengthening);
+
+    let active = [true, target_strengthening, true, true];
+    let newly_activated = !current_strengthening && target_strengthening;
+    let syntax_check_mask = [
+        key_changed[0],
+        key_changed[1] || newly_activated,
+        key_changed[2],
+        key_changed[3],
+    ];
+
+    let normalized = normalized_from_values(&values);
+    model::validate_candidates_with_active(&normalized, &syntax_check_mask, &active).map_err(
+        |error| format!("{}: {}", error.code, error.message),
+    )?;
+
+    if !is_windows {
+        for index in 0..4 {
+            if (key_changed[index] || (index == 1 && newly_activated))
+                && normalized[index].canonical() == Some(ALT_RIGHT)
+            {
+                return Err("ALT_RIGHT_BACKEND_FAILED: 当前平台不支持右 Alt 快捷键".to_string());
+            }
+        }
+    }
+
+    let conflict_candidates = model::effective_conflict_candidates(&normalized, &active);
+    let graph = build_conflict_graph(&conflict_candidates);
+    let fields = build_fields(&values, &normalized, &graph, &templates, &active);
+
+    let mut persist = crate::config::shortcut_config::ShortcutDomainPersist::default();
+    for index in 0..4 {
+        if key_changed[index] {
+            let val_str = match &normalized[index] {
+                NormalizedShortcut::Empty => String::new(),
+                NormalizedShortcut::Valid(c) => c.clone(),
+                NormalizedShortcut::Invalid(r) => r.clone(),
+            };
+            persist.keys.push((ShortcutField::ALL[index], val_str));
+        }
+        if template_changed[index] {
+            persist.templates.push((ShortcutField::ALL[index], templates[index].clone()));
+        }
+    }
+    if strengthening_changed {
+        persist.text_strengthening_enabled = Some(target_strengthening);
+    }
+
+    Ok(TransactionPlan {
+        values,
+        templates,
+        normalized,
+        target_strengthening,
+        active,
+        fields,
+        persist,
+    })
+}
+
+pub(crate) fn execute_transaction_workflow<R, P, B>(
+    plan: &TransactionPlan,
+    old_fields: &[FieldRuntime; 4],
+    mut register_fn: R,
+    mut teardown_fn: impl FnMut(),
+    mut persist_fn: P,
+    mut stop_backend_fn: B,
+) -> Result<RegistrationResult, String>
+where
+    R: FnMut(&[FieldRuntime; 4]) -> RegistrationResult,
+    P: FnMut(&crate::config::shortcut_config::ShortcutDomainPersist) -> Result<(), String>,
+    B: FnMut(&mut Option<native::AltRightBackend>),
+{
+    teardown_fn();
+    let mut result = register_fn(&plan.fields);
+    if !result.errors.is_empty() {
+        stop_backend_fn(&mut result.backend);
+        teardown_fn();
+        let rollback = register_fn(old_fields);
+        if !rollback.errors.is_empty() {
+            return Err(format!(
+                "SHORTCUT_ROLLBACK_FAILED: 新注册失败: {}; 回滚失败: {}",
+                result.errors.join("; "),
+                rollback.errors.join("; ")
+            ));
+        }
+        return Err(format!(
+            "SHORTCUT_REGISTER_FAILED: {}",
+            result.errors.join("; ")
+        ));
+    }
+
+    if !plan.persist.is_empty() {
+        if let Err(error) = persist_fn(&plan.persist) {
+            stop_backend_fn(&mut result.backend);
+            teardown_fn();
+            let rollback = register_fn(old_fields);
+            if !rollback.errors.is_empty() {
+                return Err(format!(
+                    "SHORTCUT_ROLLBACK_FAILED: 写盘失败后回滚失败: {}; {}",
+                    error,
+                    rollback.errors.join("; ")
+                ));
+            }
+            return Err(error);
+        }
+    }
+
+    Ok(result)
 }
 
 fn build_fields(
@@ -973,25 +1062,6 @@ fn build_fields(
         }
         runtime
     })
-}
-
-fn build_persist_patch(
-    normalized: &[NormalizedShortcut; 4],
-    changed: &[bool; 4],
-) -> Vec<(ShortcutField, String)> {
-    let mut patch = Vec::new();
-    for index in 0..4 {
-        if !changed[index] {
-            continue;
-        }
-        let value = match &normalized[index] {
-            NormalizedShortcut::Empty => String::new(),
-            NormalizedShortcut::Valid(canonical) => canonical.clone(),
-            NormalizedShortcut::Invalid(raw) => raw.clone(),
-        };
-        patch.push((ShortcutField::ALL[index], value));
-    }
-    patch
 }
 
 fn build_update_result(
@@ -1322,36 +1392,50 @@ mod tests {
             shortcut2: values[1].map(str::to_string),
             extract_shortcut: values[2].map(str::to_string),
             extract_shortcut2: values[3].map(str::to_string),
+            ..Default::default()
         }
     }
 
     #[test]
-    fn build_persist_patch_normalizes_backspace_to_empty() {
-        let mut values = [
-            "Backspace".to_string(),
-            String::new(),
-            String::new(),
-            String::new(),
-        ];
-        let mut changed = [false; 4];
-        apply_patch_to_values(&mut values, &mut changed, &patch([Some("Backspace"), None, None, None]));
-        let normalized = normalized_from_values(&values);
-        let persist = build_persist_patch(&normalized, &changed);
-        assert_eq!(persist, vec![(ShortcutField::Shortcut, String::new())]);
+    fn plan_transaction_normalizes_backspace_to_empty() {
+        let current_values = std::array::from_fn(|_| String::new());
+        let current_templates = std::array::from_fn(|_| String::new());
+        let patch = ShortcutDomainPatch {
+            shortcut: Some("Backspace".to_string()),
+            ..Default::default()
+        };
+        let plan = plan_shortcut_transaction(
+            &current_values,
+            &current_templates,
+            false,
+            &patch,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.persist.keys,
+            vec![(ShortcutField::Shortcut, String::new())]
+        );
     }
 
     #[test]
-    fn build_persist_patch_canonicalizes_valid_values() {
-        let values = [
-            "ctrl+shift+a".to_string(),
-            String::new(),
-            String::new(),
-            String::new(),
-        ];
-        let normalized = normalized_from_values(&values);
-        let persist = build_persist_patch(&normalized, &[true, false, false, false]);
+    fn plan_transaction_canonicalizes_valid_values() {
+        let current_values = std::array::from_fn(|_| String::new());
+        let current_templates = std::array::from_fn(|_| String::new());
+        let patch = ShortcutDomainPatch {
+            shortcut: Some("ctrl+shift+a".to_string()),
+            ..Default::default()
+        };
+        let plan = plan_shortcut_transaction(
+            &current_values,
+            &current_templates,
+            false,
+            &patch,
+            true,
+        )
+        .unwrap();
         assert_eq!(
-            persist,
+            plan.persist.keys,
             vec![(ShortcutField::Shortcut, "Ctrl+Shift+A".to_string())]
         );
     }
@@ -1466,6 +1550,216 @@ mod tests {
             assert!(fields_prefix[0].registered);
         }
         assert!(!fields_prefix[1].registered);
+    }
+
+    #[test]
+    fn transaction_plan_resolves_conflict_on_simultaneous_reenable() {
+        let current_values = [
+            "F4".to_string(),
+            "F4".to_string(),
+            "F6".to_string(),
+            String::new(),
+        ];
+        let current_templates = std::array::from_fn(|_| "tpl".to_string());
+        let patch = ShortcutDomainPatch {
+            shortcut2: Some("F5".to_string()),
+            text_strengthening_enabled: Some(true),
+            ..Default::default()
+        };
+        let plan = plan_shortcut_transaction(
+            &current_values,
+            &current_templates,
+            false,
+            &patch,
+            true,
+        )
+        .expect("plan should resolve duplicate conflict");
+
+        assert_eq!(plan.target_strengthening, true);
+        assert_eq!(plan.values[1], "F5");
+        assert_eq!(plan.persist.keys, vec![(ShortcutField::Shortcut2, "F5".to_string())]);
+        assert_eq!(plan.persist.text_strengthening_enabled, Some(true));
+    }
+
+    #[test]
+    fn transaction_plan_conflicting_patch_on_reenable_fails() {
+        let current_values = [
+            "F4".to_string(),
+            "F8".to_string(),
+            "F6".to_string(),
+            String::new(),
+        ];
+        let current_templates = std::array::from_fn(|_| "tpl".to_string());
+        let patch = ShortcutDomainPatch {
+            shortcut2: Some("F4".to_string()),
+            text_strengthening_enabled: Some(true),
+            ..Default::default()
+        };
+        let err = plan_shortcut_transaction(
+            &current_values,
+            &current_templates,
+            false,
+            &patch,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("SHORTCUT_CONFLICT"));
+    }
+
+    #[test]
+    fn transaction_plan_newly_activated_invalid_syntax_fails() {
+        let current_values = [
+            "F4".to_string(),
+            "InvalidKeySyntax".to_string(),
+            "F6".to_string(),
+            String::new(),
+        ];
+        let current_templates = std::array::from_fn(|_| "tpl".to_string());
+        let patch = ShortcutDomainPatch {
+            text_strengthening_enabled: Some(true),
+            ..Default::default()
+        };
+        let err = plan_shortcut_transaction(
+            &current_values,
+            &current_templates,
+            false,
+            &patch,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("INVALID_SHORTCUT"));
+    }
+
+    #[test]
+    fn transaction_plan_key_only_patch_touches_no_templates_or_flag() {
+        let current_values = [
+            "F4".to_string(),
+            "F5".to_string(),
+            "F6".to_string(),
+            String::new(),
+        ];
+        let current_templates = [
+            "t1".to_string(),
+            "t2".to_string(),
+            "t3".to_string(),
+            "t4".to_string(),
+        ];
+        let patch = ShortcutDomainPatch {
+            shortcut: Some("F8".to_string()),
+            ..Default::default()
+        };
+        let plan = plan_shortcut_transaction(
+            &current_values,
+            &current_templates,
+            true,
+            &patch,
+            true,
+        )
+        .expect("plan should succeed");
+
+        assert_eq!(plan.persist.keys, vec![(ShortcutField::Shortcut, "F8".to_string())]);
+        assert!(plan.persist.templates.is_empty());
+        assert_eq!(plan.persist.text_strengthening_enabled, None);
+    }
+
+    #[test]
+    fn transaction_workflow_rollback_on_registration_failure() {
+        let plan = plan_shortcut_transaction(
+            &["F4".to_string(), "F5".to_string(), "F6".to_string(), "".to_string()],
+            &std::array::from_fn(|_| "".to_string()),
+            true,
+            &ShortcutDomainPatch { shortcut: Some("F8".to_string()), ..Default::default() },
+            true,
+        ).unwrap();
+        let old_fields = std::array::from_fn(|i| FieldRuntime::empty(ShortcutField::ALL[i]));
+
+        let mut rollback_called = false;
+        let mut persist_called = false;
+
+        let err = execute_transaction_workflow(
+            &plan,
+            &old_fields,
+            |fields| {
+                if fields[0].value == "F8" {
+                    RegistrationResult {
+                        errors: vec!["OS Hotkey conflict".to_string()],
+                        ..Default::default()
+                    }
+                } else {
+                    rollback_called = true;
+                    RegistrationResult::default()
+                }
+            },
+            || {},
+            |_| {
+                persist_called = true;
+                Ok(())
+            },
+            |_| {},
+        ).unwrap_err();
+
+        assert!(err.contains("SHORTCUT_REGISTER_FAILED"));
+        assert!(rollback_called, "Rollback to old fields must be called");
+        assert!(!persist_called, "Persistence must never be called on registration failure");
+    }
+
+    #[test]
+    fn transaction_workflow_rollback_on_persistence_failure() {
+        let plan = plan_shortcut_transaction(
+            &["F4".to_string(), "F5".to_string(), "F6".to_string(), "".to_string()],
+            &std::array::from_fn(|_| "".to_string()),
+            true,
+            &ShortcutDomainPatch { shortcut: Some("F8".to_string()), ..Default::default() },
+            true,
+        ).unwrap();
+        let old_fields = std::array::from_fn(|i| FieldRuntime::empty(ShortcutField::ALL[i]));
+
+        let mut rollback_called = false;
+
+        let err = execute_transaction_workflow(
+            &plan,
+            &old_fields,
+            |fields| {
+                if fields[0].value != "F8" {
+                    rollback_called = true;
+                }
+                RegistrationResult::default()
+            },
+            || {},
+            |_| Err("IO disk failure".to_string()),
+            |_| {},
+        ).unwrap_err();
+
+        assert_eq!(err, "IO disk failure");
+        assert!(rollback_called, "Rollback to old fields must be called on persistence failure");
+    }
+
+    #[test]
+    fn transaction_workflow_surfaces_rollback_failure() {
+        let plan = plan_shortcut_transaction(
+            &["F4".to_string(), "F5".to_string(), "F6".to_string(), "".to_string()],
+            &std::array::from_fn(|_| "".to_string()),
+            true,
+            &ShortcutDomainPatch { shortcut: Some("F8".to_string()), ..Default::default() },
+            true,
+        ).unwrap();
+        let old_fields = std::array::from_fn(|i| FieldRuntime::empty(ShortcutField::ALL[i]));
+
+        let err = execute_transaction_workflow(
+            &plan,
+            &old_fields,
+            |_| {
+                RegistrationResult {
+                    errors: vec!["Registration failed".to_string()],
+                    ..Default::default()
+                }
+            },
+            || {},
+            |_| Ok(()),
+            |_| {},
+        ).unwrap_err();
+
+        assert!(err.contains("SHORTCUT_ROLLBACK_FAILED"));
     }
 
     #[test]

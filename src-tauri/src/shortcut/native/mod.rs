@@ -30,6 +30,14 @@ pub struct AltRightBackend {
     stop: Option<Box<dyn FnOnce() + Send>>,
 }
 
+impl std::fmt::Debug for AltRightBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AltRightBackend")
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
 impl AltRightBackend {
     pub fn kind(&self) -> BackendKind {
         self.kind
