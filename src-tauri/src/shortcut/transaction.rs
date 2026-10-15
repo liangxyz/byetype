@@ -105,6 +105,7 @@ impl FieldRuntime {
 #[derive(Debug, Default)]
 pub struct RegistrationResult {
     pub registered: [bool; 4],
+    pub registered_keys: Vec<String>,
     pub backend: Option<AltRightBackend>,
     pub backend_kind: Option<BackendKind>,
     pub errors: Vec<String>,
@@ -318,8 +319,9 @@ pub fn plan_shortcut_transaction(
 pub fn execute_transaction_workflow<R, P, B, S, T>(
     plan: &TransactionPlan,
     old_fields: &[FieldRuntime; 4],
+    old_registered_keys: &[String],
     mut register_fn: R,
-    mut teardown_fn: T,
+    mut teardown_keys_fn: T,
     mut persist_fn: P,
     mut stop_backend_fn: B,
     mut install_restored_fn: S,
@@ -329,15 +331,15 @@ where
     P: FnMut(&ShortcutDomainPersist) -> Result<(), String>,
     B: FnMut(&mut Option<AltRightBackend>),
     S: FnMut(RegistrationResult),
-    T: FnMut() -> Result<(), String>,
+    T: FnMut(&[String]) -> Result<(), String>,
 {
-    teardown_fn()?;
+    teardown_keys_fn(old_registered_keys)?;
     let mut result = register_fn(&plan.fields);
     if !result.errors.is_empty() {
         stop_backend_fn(&mut result.backend);
-        if let Err(first_cleanup_err) = teardown_fn() {
-            // Teardown of partial candidate failed. Never register old set into uncertain state!
-            let retry_err = teardown_fn().err();
+        if let Err(first_cleanup_err) = teardown_keys_fn(&result.registered_keys) {
+            // Targeted teardown of candidate keys failed. Retry once:
+            let retry_err = teardown_keys_fn(&result.registered_keys).err();
             let mut errs = result.errors;
             errs.push(first_cleanup_err);
             if let Some(re) = retry_err {
@@ -351,7 +353,7 @@ where
         let mut rollback = register_fn(old_fields);
         if !rollback.errors.is_empty() {
             stop_backend_fn(&mut rollback.backend);
-            let final_cleanup = teardown_fn().err();
+            let final_cleanup = teardown_keys_fn(&rollback.registered_keys).err();
             let mut msg = format!(
                 "SHORTCUT_ROLLBACK_FAILED: 新注册失败: {}; 回滚失败: {}",
                 result.errors.join("; "),
@@ -372,8 +374,8 @@ where
     if !plan.persist.is_empty() {
         if let Err(error) = persist_fn(&plan.persist) {
             stop_backend_fn(&mut result.backend);
-            if let Err(first_cleanup_err) = teardown_fn() {
-                let retry_err = teardown_fn().err();
+            if let Err(first_cleanup_err) = teardown_keys_fn(&result.registered_keys) {
+                let retry_err = teardown_keys_fn(&result.registered_keys).err();
                 let mut msg = format!(
                     "SHORTCUT_ROLLBACK_FAILED: 写盘失败后注销清理失败: {error}; {first_cleanup_err}"
                 );
@@ -385,7 +387,7 @@ where
             let mut rollback = register_fn(old_fields);
             if !rollback.errors.is_empty() {
                 stop_backend_fn(&mut rollback.backend);
-                let final_cleanup = teardown_fn().err();
+                let final_cleanup = teardown_keys_fn(&rollback.registered_keys).err();
                 let mut msg = format!(
                     "SHORTCUT_ROLLBACK_FAILED: 写盘失败后回滚失败: {}; {}",
                     error,
@@ -411,6 +413,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use crate::shortcut::native;
     use crate::config::shortcut_config;
+    use std::sync::Mutex;
+    use std::collections::HashSet;
 
     #[test]
     fn plan_transaction_normalizes_backspace_to_empty() {
@@ -585,6 +589,7 @@ mod tests {
         let err = execute_transaction_workflow(
             &plan,
             &old_fields,
+            &[],
             |fields| {
                 if fields[0].value == "F8" {
                     RegistrationResult {
@@ -603,11 +608,12 @@ mod tests {
                         backend: Some(backend),
                         backend_kind: Some(BackendKind::RawInput),
                         registered: [true, false, false, false],
+                        registered_keys: Vec::new(),
                         errors: Vec::new(),
                     }
                 }
             },
-            || Ok(()),
+            |_keys| Ok(()),
             |_| Ok(()),
             |_| {},
             |restored| {
@@ -642,6 +648,7 @@ mod tests {
         let err = execute_transaction_workflow(
             &plan,
             &old_fields,
+            &[],
             |fields| {
                 if fields[0].value == "F8" {
                     RegistrationResult::default()
@@ -657,12 +664,15 @@ mod tests {
                         backend: Some(backend),
                         backend_kind: Some(BackendKind::RawInput),
                         registered: [true, false, false, false],
+                        registered_keys: Vec::new(),
                         errors: Vec::new(),
                     }
                 }
             },
-            || Ok(()),
-            |_| Err("IO write failure".to_string()),
+            |_keys| Ok(()),
+            |_persist| {
+                Err("IO write failure".to_string())
+            },
             |_| {},
             |restored| {
                 restored_backend = restored.backend;
@@ -671,7 +681,7 @@ mod tests {
 
         assert_eq!(err, "IO write failure");
         assert_eq!(drop_count.load(Ordering::SeqCst), 0, "Restored backend must remain alive after persist error");
-        assert!(restored_backend.is_some(), "Restored backend must be adopted");
+        assert!(restored_backend.is_some());
 
         drop(restored_backend);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1, "Backend stop hook runs when adopted owner is dropped");
@@ -694,6 +704,7 @@ mod tests {
         let err = execute_transaction_workflow(
             &plan,
             &old_fields,
+            &[],
             |fields| {
                 if fields[0].value == "F8" {
                     let dc = candidate_drop_clone.clone();
@@ -715,7 +726,7 @@ mod tests {
                     }
                 }
             },
-            || Ok(()),
+            |_keys| Ok(()),
             |_| Ok(()),
             |backend_opt| {
                 if let Some(mut backend) = backend_opt.take() {
@@ -744,10 +755,7 @@ mod tests {
         let templates = std::array::from_fn(|_| String::new());
         let fields = build_fields(&values, &normalized, &graph, &templates, &active, true);
 
-        // slot 0 should be registered
         assert!(fields[0].registered);
-
-        // slot 1 (shortcut2) should NOT be registered and have skip_reason
         assert!(!fields[1].registered);
         assert!(!fields[1].uses_native_alt_right);
         assert_eq!(
@@ -850,6 +858,7 @@ mod tests {
         let result = execute_transaction_workflow(
             &plan,
             &old_fields,
+            &[],
             |fields| {
                 for i in 0..4 {
                     registered_map[i] = fields[i].registered;
@@ -859,7 +868,7 @@ mod tests {
                     ..Default::default()
                 }
             },
-            || Ok(()),
+            |_keys| Ok(()),
             |persist| {
                 shortcut_config::apply_shortcut_domain_persist(&mut raw_disk, persist)
             },
@@ -867,7 +876,6 @@ mod tests {
             |_| {},
         ).unwrap();
 
-        // Runtime reflects new registration
         assert!(result.registered[0], "Slot 0 must be registered");
         assert!(result.registered[1], "Slot 1 must now be registered because strengthening is true");
 
@@ -883,7 +891,6 @@ mod tests {
         assert_eq!(update_res.shortcut_template, "new-tpl");
         assert_eq!(update_res.text_strengthening_enabled, true);
 
-        // Disk reflects all changed domain fields together, while theme is preserved
         assert_eq!(raw_disk["general"]["shortcut"], "F8");
         assert_eq!(raw_disk["general"]["shortcutTemplate"], "new-tpl");
         assert_eq!(raw_disk["general"]["textStrengtheningEnabled"], true);
@@ -920,6 +927,7 @@ mod tests {
         let err = execute_transaction_workflow(
             &plan,
             &old_fields,
+            &["F4".to_string()],
             |fields| {
                 if fields[0].value == "F8" {
                     RegistrationResult {
@@ -934,7 +942,7 @@ mod tests {
                     }
                 }
             },
-            || Ok(()),
+            |_keys| Ok(()),
             |persist| shortcut_config::apply_shortcut_domain_persist(&mut raw_disk, persist),
             |_| {},
             |restored| {
@@ -943,12 +951,8 @@ mod tests {
         ).unwrap_err();
 
         assert!(err.contains("SHORTCUT_REGISTER_FAILED"));
-
-        // Disk remains completely untouched
         assert_eq!(raw_disk["general"]["shortcut"], "F4");
         assert_eq!(raw_disk["general"]["textStrengtheningEnabled"], false);
-
-        // Runtime mapping restored to old fields
         assert_eq!(current_registered_map, [true, false, false, false]);
         assert!(restored_result.is_some());
     }
@@ -977,6 +981,7 @@ mod tests {
         let err = execute_transaction_workflow(
             &plan,
             &old_fields,
+            &[],
             |fields| {
                 if fields[0].value == "F8" {
                     RegistrationResult {
@@ -992,13 +997,13 @@ mod tests {
                         backend: Some(backend),
                         backend_kind: Some(BackendKind::RawInput),
                         registered: [true, false, false, false],
+                        registered_keys: Vec::new(),
                         errors: Vec::new(),
                     }
                 }
             },
-            || Ok(()),
+            |_keys| Ok(()),
             |_persist| {
-                // Disk write fails
                 Err("Simulated disk error".to_string())
             },
             |_| {},
@@ -1030,8 +1035,9 @@ mod tests {
         let err = execute_transaction_workflow(
             &plan,
             &old_fields,
+            &[],
             |_| RegistrationResult::default(),
-            || Err("UNREGISTER_FAILED: OS unregister error".to_string()),
+            |_keys| Err("UNREGISTER_FAILED: OS unregister error".to_string()),
             |_| Ok(()),
             |_| {},
             |_| {},
@@ -1057,10 +1063,11 @@ mod tests {
         let err = execute_transaction_workflow(
             &plan,
             &old_fields,
+            &[],
             |fields| {
                 if fields[0].value == "F8" {
                     RegistrationResult {
-                        errors: vec!["Initial registration failure".to_string()],
+                        errors: vec!["Initial failure".to_string()],
                         ..Default::default()
                     }
                 } else {
@@ -1078,7 +1085,7 @@ mod tests {
                     }
                 }
             },
-            || Ok(()),
+            |_keys| Ok(()),
             |_| Ok(()),
             |backend_opt| {
                 if let Some(mut backend) = backend_opt.take() {
@@ -1108,6 +1115,7 @@ mod tests {
         let err = execute_transaction_workflow(
             &plan,
             &old_fields,
+            &[],
             |fields| {
                 if fields[0].value != "F8" {
                     rollback_registered = true;
@@ -1117,7 +1125,7 @@ mod tests {
                     ..Default::default()
                 }
             },
-            || {
+            |_keys| {
                 teardown_calls += 1;
                 if teardown_calls > 1 {
                     Err("UNREGISTER_FAILED: Failed to unregister partial candidate".to_string())
@@ -1152,19 +1160,18 @@ mod tests {
         let err = execute_transaction_workflow(
             &plan,
             &old_fields,
+            &[],
             |_| {
                 RegistrationResult {
                     errors: vec!["Candidate registration error".to_string()],
                     ..Default::default()
                 }
             },
-            || {
+            |_keys| {
                 teardown_calls += 1;
                 if teardown_calls == 2 {
-                    // First candidate teardown fails
                     Err("First teardown failed".to_string())
                 } else if teardown_calls == 3 {
-                    // Retry teardown succeeds
                     partial_map_cleared = true;
                     Ok(())
                 } else {
@@ -1197,13 +1204,14 @@ mod tests {
         let err = execute_transaction_workflow(
             &plan,
             &old_fields,
+            &[],
             |_| {
                 RegistrationResult {
                     errors: vec!["Candidate error".to_string()],
                     ..Default::default()
                 }
             },
-            || {
+            |_keys| {
                 teardown_calls += 1;
                 if teardown_calls > 1 {
                     Err(format!("Cleanup error #{teardown_calls}"))
@@ -1223,8 +1231,6 @@ mod tests {
 
     #[test]
     fn transaction_workflow_stops_partially_restored_backend_and_cleans_map() {
-        use std::sync::Mutex;
-
         let plan = plan_shortcut_transaction(
             &["F4".to_string(), "F5".to_string(), "F6".to_string(), "".to_string()],
             &std::array::from_fn(|_| "".to_string()),
@@ -1245,6 +1251,7 @@ mod tests {
         let err = execute_transaction_workflow(
             &plan,
             &old_fields,
+            &[],
             |fields| {
                 if fields[0].value == "F8" {
                     RegistrationResult {
@@ -1267,7 +1274,7 @@ mod tests {
                     }
                 }
             },
-            || {
+            |_keys| {
                 final_cleanup_clone.fetch_add(1, Ordering::SeqCst);
                 *final_map_clean.lock().unwrap() = [false; 4];
                 Ok(())
@@ -1285,5 +1292,91 @@ mod tests {
         assert_eq!(restored_drop_count.load(Ordering::SeqCst), 1, "Partially restored backend must be stopped");
         assert!(final_cleanup_called.load(Ordering::SeqCst) > 0, "Final cleanup teardown must be called");
         assert_eq!(*final_registered_map.lock().unwrap(), [false; 4], "Registration map must be cleared on rollback failure");
+    }
+
+    #[test]
+    fn adapter_fake_reproduces_plugin_mem_take_drain_and_targeted_cleanup_detects_it() {
+        // Models tauri-plugin-global-shortcut where unregister_all() drains its map
+        struct FakePlugin {
+            registered: HashSet<String>,
+            os_fail_keys: HashSet<String>,
+        }
+
+        impl FakePlugin {
+            fn unregister_targeted(&mut self, key: &str) -> Result<(), String> {
+                if self.os_fail_keys.contains(key) {
+                    Err(format!("OS failed to unregister {key}"))
+                } else {
+                    self.registered.remove(key);
+                    Ok(())
+                }
+            }
+
+            fn unregister_all_draining(&mut self) -> Result<(), String> {
+                let map = std::mem::take(&mut self.registered);
+                for key in map {
+                    if self.os_fail_keys.contains(&key) {
+                        return Err(format!("OS failed to unregister {key}"));
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        let plugin = Arc::new(Mutex::new(FakePlugin {
+            registered: ["F8".to_string()].into_iter().collect(),
+            os_fail_keys: ["F8".to_string()].into_iter().collect(),
+        }));
+
+        let plan = plan_shortcut_transaction(
+            &["F4".to_string(), "F5".to_string(), "F6".to_string(), "".to_string()],
+            &std::array::from_fn(|_| "".to_string()),
+            true,
+            &ShortcutDomainPatch { shortcut: Some("F8".to_string()), ..Default::default() },
+            true,
+        ).unwrap();
+        let old_fields = std::array::from_fn(|i| FieldRuntime::empty(ShortcutField::ALL[i]));
+
+        let p_clean = plugin.clone();
+        let err = execute_transaction_workflow(
+            &plan,
+            &old_fields,
+            &[],
+            |fields| {
+                if fields[0].value == "F8" {
+                    RegistrationResult {
+                        registered: [true, false, false, false],
+                        registered_keys: vec!["F8".to_string()],
+                        errors: vec!["Trigger rollback".to_string()],
+                        ..Default::default()
+                    }
+                } else {
+                    RegistrationResult::default()
+                }
+            },
+            |keys| {
+                let mut p = p_clean.lock().unwrap();
+                let mut errs = Vec::new();
+                for k in keys {
+                    if let Err(e) = p.unregister_targeted(k) {
+                        errs.push(e);
+                    }
+                }
+                // Call draining unregister_all
+                let _ = p.unregister_all_draining();
+                if errs.is_empty() {
+                    Ok(())
+                } else {
+                    Err(errs.join("; "))
+                }
+            },
+            |_| Ok(()),
+            |_| {},
+            |_| {},
+        ).unwrap_err();
+
+        // Targeted check detected the OS unregistration failure despite unregister_all having drained
+        assert!(err.contains("SHORTCUT_ROLLBACK_FAILED"));
+        assert!(err.contains("OS failed to unregister F8"));
     }
 }

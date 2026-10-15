@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
-import { AppConfig, ShortcutPatch, TemplateEntry } from '../../../core/types'
+import { AppConfig, ShortcutUpdateResult, TemplateEntry } from '../../../core/types'
 import { PromptEditor } from './PromptEditor'
 import { createUserPromptFile, updateShortcuts } from '../../../lib/tauri-api'
-import { mergeConfirmedShortcutDomain } from '../../../core/shortcut-domain'
+import { executeTemplateDeletion, mergeConfirmedShortcutDomain } from '../../../core/shortcut-domain'
 
 type TemplateKind = 'voice' | 'image'
 
@@ -25,13 +25,18 @@ interface Props {
   kind: TemplateKind
   config: AppConfig
   onSave: (config: AppConfig) => void
+  onDeleteTemplate?: (
+    kind: TemplateKind,
+    deletedId: string,
+    confirmedDomain?: ShortcutUpdateResult,
+  ) => void
 }
 
 /**
  * 模板提示词编辑：列表选择 + 一个编辑器。
  * 保留改名、新增/删除自定义模板、选择文件、恢复内置的能力。
  */
-export function TemplatePromptsPanel({ kind, config, onSave }: Props) {
+export function TemplatePromptsPanel({ kind, config, onSave, onDeleteTemplate }: Props) {
   const templates = (kind === 'voice' ? config.voiceTemplates.templates : config.extract.templates) ?? []
   const [selectedId, setSelectedId] = useState(templates[0]?.id ?? '')
   const current = templates.find(t => t.id === selectedId) ?? templates[0]
@@ -87,35 +92,34 @@ export function TemplatePromptsPanel({ kind, config, onSave }: Props) {
   // 避免界面显示一个模板、后端却按已删除的模板执行。
   // 必须严格执行 Fail-Closed：若绑定重定向失败，严禁删除模板或更改选择。
   const deleteTemplate = async () => {
-    const remaining = templates.filter(t => t.id !== current.id)
-    const fallback = remaining[0]?.id ?? ''
-    const patch: ShortcutPatch = {}
-    if (kind === 'voice') {
-      if (config.general.shortcutTemplate === current.id) patch.shortcutTemplate = fallback
-      if (config.general.shortcut2Template === current.id) patch.shortcut2Template = fallback
-    } else {
-      if (config.general.extractShortcutTemplate === current.id) patch.extractShortcutTemplate = fallback
-      if (config.general.extractShortcut2Template === current.id) patch.extractShortcut2Template = fallback
-    }
-
-    let updatedGeneral = config.general
-    if (Object.keys(patch).length > 0) {
-      try {
-        const confirmed = await updateShortcuts(patch)
-        updatedGeneral = mergeConfirmedShortcutDomain(config.general, confirmed)
-      } catch (e: any) {
-        const errorMsg = typeof e === 'string' ? e : e?.message || '更新快捷键绑定失败'
-        alert(`删除模板失败：无法更新关联的快捷键绑定（${errorMsg}），已取消删除。`)
-        return
-      }
-    }
-
-    if (kind === 'voice') {
-      onSave({ ...config, general: updatedGeneral, voiceTemplates: { ...config.voiceTemplates, templates: remaining } })
-    } else {
-      onSave({ ...config, general: updatedGeneral, extract: { ...config.extract, templates: remaining } })
-    }
-    setSelectedId(remaining[0]?.id ?? '')
+    await executeTemplateDeletion({
+      kind,
+      currentId: current.id,
+      templates,
+      general: config.general,
+      updateShortcutsFn: updateShortcuts,
+      onSuccess: ({ deletedId, fallbackId, confirmedDomain }) => {
+        if (onDeleteTemplate) {
+          onDeleteTemplate(kind, deletedId, confirmedDomain)
+        } else {
+          const remaining = templates.filter(t => t.id !== deletedId)
+          const general = confirmedDomain
+            ? mergeConfirmedShortcutDomain(config.general, confirmedDomain)
+            : config.general
+          onSave({
+            ...config,
+            general,
+            ...(kind === 'voice'
+              ? { voiceTemplates: { ...config.voiceTemplates, templates: remaining } }
+              : { extract: { ...config.extract, templates: remaining } }),
+          })
+        }
+        setSelectedId(fallbackId)
+      },
+      onError: (msg) => {
+        alert(`删除模板失败：无法更新关联的快捷键绑定（${msg}），已取消删除。`)
+      },
+    })
   }
 
   return (

@@ -42,3 +42,76 @@ export function computeStrengtheningPatch(
   }
   return patch
 }
+
+/**
+ * Plan the sparse patch for reassigning shortcut bindings when deleting a template.
+ */
+export function planTemplateDeletionReassignment(
+  kind: 'voice' | 'image',
+  currentId: string,
+  general: GeneralConfig,
+  remainingTemplates: { id: string }[],
+): { patch: ShortcutPatch; fallbackId: string } {
+  const fallbackId = remainingTemplates[0]?.id ?? ''
+  const patch: ShortcutPatch = {}
+  if (kind === 'voice') {
+    if (general.shortcutTemplate === currentId) patch.shortcutTemplate = fallbackId
+    if (general.shortcut2Template === currentId) patch.shortcut2Template = fallbackId
+  } else {
+    if (general.extractShortcutTemplate === currentId) patch.extractShortcutTemplate = fallbackId
+    if (general.extractShortcut2Template === currentId) patch.extractShortcut2Template = fallbackId
+  }
+  return { patch, fallbackId }
+}
+
+/**
+ * Execute template deletion sequencing:
+ * 1. Plans any needed binding reassignment;
+ * 2. If needed, awaits backend reassignment;
+ * 3. On failure: fails closed (calls onError and stops without deleting);
+ * 4. On success: calls onSuccess to let the caller update state and remove template.
+ */
+export async function executeTemplateDeletion({
+  kind,
+  currentId,
+  templates,
+  general,
+  updateShortcutsFn,
+  onSuccess,
+  onError,
+}: {
+  kind: 'voice' | 'image'
+  currentId: string
+  templates: { id: string; name: string }[]
+  general: GeneralConfig
+  updateShortcutsFn: (patch: ShortcutPatch) => Promise<ShortcutUpdateResult>
+  onSuccess: (data: {
+    kind: 'voice' | 'image'
+    deletedId: string
+    fallbackId: string
+    confirmedDomain?: ShortcutUpdateResult
+  }) => void
+  onError: (error: string) => void
+}): Promise<boolean> {
+  const remaining = templates.filter(t => t.id !== currentId)
+  const { patch, fallbackId } = planTemplateDeletionReassignment(kind, currentId, general, remaining)
+
+  let confirmedDomain: ShortcutUpdateResult | undefined
+  if (Object.keys(patch).length > 0) {
+    try {
+      confirmedDomain = await updateShortcutsFn(patch)
+    } catch (e: any) {
+      const msg = typeof e === 'string' ? e : e?.message || '更新快捷键绑定失败'
+      onError(msg)
+      return false
+    }
+  }
+
+  onSuccess({
+    kind,
+    deletedId: currentId,
+    fallbackId,
+    confirmedDomain,
+  })
+  return true
+}

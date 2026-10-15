@@ -92,6 +92,7 @@ struct Inner {
     alt_right_backend: Option<native::AltRightBackend>,
     backend_kind: Option<BackendKind>,
     last_registration_errors: Vec<String>,
+    registered_tauri_keys: Vec<String>,
     native_events_seen: u64,
     native_events_dispatched: u64,
     voice_slots: [Arc<VoiceSlot>; 2],
@@ -139,6 +140,7 @@ impl ShortcutManager {
                 alt_right_backend: None,
                 backend_kind: None,
                 last_registration_errors: Vec::new(),
+                registered_tauri_keys: Vec::new(),
                 native_events_seen: 0,
                 native_events_dispatched: 0,
                 voice_slots: [Arc::new(VoiceSlot::default()), Arc::new(VoiceSlot::default())],
@@ -471,7 +473,7 @@ impl ShortcutManager {
 
     // ---------- registration ----------
 
-    fn teardown(&self, app: &AppHandle) -> Result<(), String> {
+    fn teardown_keys(&self, app: &AppHandle, keys: &[String]) -> Result<(), String> {
         let backend = {
             let mut inner = self.lock_inner();
             inner.alt_right_backend.take()
@@ -479,13 +481,25 @@ impl ShortcutManager {
         if let Some(mut backend) = backend {
             backend.stop();
         }
-        let unreg_res = app
-            .global_shortcut()
-            .unregister_all()
-            .map_err(|e| format!("UNREGISTER_FAILED: 无法注销既有快捷键: {e}"));
+
+        let mut errors = Vec::new();
+        // 1. Unregister targeted known keys
+        for key in keys {
+            if let Err(e) = app.global_shortcut().unregister(key.as_str()) {
+                errors.push(format!("{key}: {e}"));
+            }
+        }
+        // 2. Also unregister_all as belt-and-suspenders
+        let _ = app.global_shortcut().unregister_all();
+
         let mut inner = self.lock_inner();
         inner.pressed = [false; 4];
-        unreg_res
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("UNREGISTER_FAILED: 无法注销快捷键: {}", errors.join("; ")))
+        }
     }
 
     fn perform_registration(
@@ -499,7 +513,12 @@ impl ShortcutManager {
                 continue;
             }
             match register_tauri_shortcut(app, field) {
-                Ok(()) => result.registered[index] = true,
+                Ok(()) => {
+                    result.registered[index] = true;
+                    if let Some(canonical) = field.normalized.canonical() {
+                        result.registered_keys.push(canonical.to_string());
+                    }
+                }
                 Err(error) => result.errors.push(error),
             }
         }
@@ -548,6 +567,7 @@ impl ShortcutManager {
         inner.alt_right_backend = backend.backend;
         inner.backend_kind = backend.backend_kind;
         inner.last_registration_errors = errors;
+        inner.registered_tauri_keys = backend.registered_keys;
         inner.pressed = [false; 4];
         inner.registration_generation = inner.registration_generation.wrapping_add(1);
         inner.switching = false;
@@ -567,11 +587,12 @@ impl ShortcutManager {
         let fields = build_fields(&values, &normalized, &graph, &templates, &active, is_windows());
 
         let _guard = self.lock_update();
+        let old_keys = { self.lock_inner().registered_tauri_keys.clone() };
         {
             let mut inner = self.lock_inner();
             inner.switching = true;
         }
-        let _ = self.teardown(app);
+        let _ = self.teardown_keys(app, &old_keys);
         let result = self.perform_registration(app, &fields);
         for error in &result.errors {
             eprintln!("[shortcut] 启动注册警告: {error}");
@@ -613,7 +634,10 @@ impl ShortcutManager {
             is_windows(),
         )?;
 
-        let old_fields = { self.lock_inner().runtime.clone() };
+        let (old_fields, old_registered_keys) = {
+            let inner = self.lock_inner();
+            (inner.runtime.clone(), inner.registered_tauri_keys.clone())
+        };
 
         {
             let mut inner = self.lock_inner();
@@ -625,8 +649,9 @@ impl ShortcutManager {
         let result = execute_transaction_workflow(
             &plan,
             &old_fields,
+            &old_registered_keys,
             |fields| self.perform_registration(app, fields),
-            || self.teardown(app),
+            |keys| self.teardown_keys(app, keys),
             |persist| config_manager.commit_shortcut_domain_patch(persist).map(|_| ()),
             |backend_opt| {
                 if let Some(mut backend) = backend_opt.take() {
@@ -646,12 +671,14 @@ impl ShortcutManager {
                     inner.alt_right_backend = restored_result.backend;
                     inner.backend_kind = restored_result.backend_kind;
                     inner.runtime = old_fields;
+                    inner.registered_tauri_keys = restored_result.registered_keys;
                     inner.last_registration_errors = restored_result.errors;
                     inner.pressed = [false; 4];
                     inner.switching = false;
                 } else {
                     inner.alt_right_backend = None;
                     inner.backend_kind = None;
+                    inner.registered_tauri_keys.clear();
                     inner.last_registration_errors = vec![e.clone()];
                     for f in &mut inner.runtime {
                         f.registered = false;

@@ -216,6 +216,29 @@ export function App() {
     }
   }, [showShortcutResult])
 
+  const handleTemplateDelete = useCallback((
+    kind: 'voice' | 'image',
+    deletedId: string,
+    confirmedDomain?: ShortcutUpdateResult,
+  ) => {
+    setConfig(prev => {
+      if (!prev) return prev
+      let general = prev.general
+      if (confirmedDomain) {
+        general = mergeConfirmedShortcutDomain(general, confirmedDomain)
+      }
+      const updated = {
+        ...prev,
+        general,
+        ...(kind === 'voice'
+          ? { voiceTemplates: { ...prev.voiceTemplates, templates: prev.voiceTemplates.templates.filter(t => t.id !== deletedId) } }
+          : { extract: { ...prev.extract, templates: prev.extract.templates.filter(t => t.id !== deletedId) } }),
+      }
+      handleSave(updated)
+      return updated
+    })
+  }, [handleSave])
+
   const showDot = updateState.phase === 'available' && !updateState.dismissed
 
   if (!config) return <div style={{ padding: 20, color: 'var(--text-primary)' }}>Loading...</div>
@@ -270,9 +293,9 @@ export function App() {
         {activeTab === 'extract' && <ExtractTab config={config} onSave={handleSave} />}
         {activeTab === 'voice-prompts' && <VoicePromptsTab config={config} onSave={handleSave} />}
         {activeTab === 'strengthening-prompts' && strengtheningEnabled && (
-          <StrengtheningPromptsTab config={config} onSave={handleSave} />
+          <StrengtheningPromptsTab config={config} onSave={handleSave} onDeleteTemplate={handleTemplateDelete} />
         )}
-        {activeTab === 'extract-prompts' && <ExtractPromptsTab config={config} onSave={handleSave} />}
+        {activeTab === 'extract-prompts' && <ExtractPromptsTab config={config} onSave={handleSave} onDeleteTemplate={handleTemplateDelete} />}
         {activeTab === 'backup' && config && <BackupTab config={config} onSave={handleSave} />}
         {activeTab === 'about' && (
           <AboutTab
