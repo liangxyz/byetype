@@ -295,10 +295,8 @@ pub fn migrate_shortcuts(
                 .and_then(|g| g.get("textStrengtheningEnabled"))
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            let mut conflict_candidate = candidate.clone();
-            if !strengthening_enabled {
-                conflict_candidate[ShortcutField::Shortcut2.index()] = NormalizedShortcut::Empty;
-            }
+            let active = [true, strengthening_enabled, true, true];
+            let conflict_candidate = model::effective_conflict_candidates(&candidate, &active);
             if build_conflict_graph(&conflict_candidate).has_conflicts() {
                 outcome.f4_kept_conflict = true;
                 outcome.diagnostics.push(
@@ -550,5 +548,54 @@ mod tests {
         assert_eq!(raw["general"]["futureField"], 7);
         assert_eq!(raw["unknownSection"]["keep"], true);
         assert_eq!(raw["general"]["launchAtLogin"], true);
+    }
+
+    #[test]
+    fn stored_shortcut2_survives_disable_update_restart_reenable() {
+        // Initial state with shortcut2 configured and strengthening enabled
+        let mut raw = json!({
+            "general": {
+                "shortcut": "AltRight",
+                "shortcut2": "F8",
+                "extractShortcut": "F6",
+                "extractShortcut2": "",
+                "textStrengtheningEnabled": true,
+                SCHEMA_VERSION_KEY: 1
+            }
+        });
+
+        // 1. User disables text strengthening
+        let incoming_disable = json!({
+            "general": {
+                "textStrengtheningEnabled": false
+            }
+        });
+        merge_config_preserving_shortcuts(&mut raw, incoming_disable);
+        assert_eq!(raw["general"]["shortcut2"], "F8");
+        assert_eq!(raw["general"]["textStrengtheningEnabled"], false);
+
+        // 2. User updates non-shortcut and shortcut settings while disabled
+        let incoming_theme = json!({
+            "general": {
+                "theme": "dark"
+            }
+        });
+        merge_config_preserving_shortcuts(&mut raw, incoming_theme);
+        assert_eq!(raw["general"]["shortcut2"], "F8");
+
+        // 3. Simulated restart: migration runs, shortcut2 is preserved
+        let outcome = migrate_shortcuts(&mut raw, true, false);
+        assert_eq!(raw["general"]["shortcut2"], "F8");
+        assert!(!outcome.changed);
+
+        // 4. User re-enables text strengthening
+        let incoming_reenable = json!({
+            "general": {
+                "textStrengtheningEnabled": true
+            }
+        });
+        merge_config_preserving_shortcuts(&mut raw, incoming_reenable);
+        assert_eq!(raw["general"]["shortcut2"], "F8");
+        assert_eq!(raw["general"]["textStrengtheningEnabled"], true);
     }
 }

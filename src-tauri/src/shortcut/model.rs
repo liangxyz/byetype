@@ -405,6 +405,23 @@ pub fn validate_candidates(
     validate_candidates_with_active(values, changed, &[true; 4])
 }
 
+/// Extract the active subset of normalized shortcuts for conflict detection.
+/// Inactive fields (e.g. `shortcut2` when text strengthening is disabled) are
+/// masked as `NormalizedShortcut::Empty` so they do not participate in active
+/// conflict graphs, while the original values remain untouched for persistence.
+pub fn effective_conflict_candidates(
+    values: &[NormalizedShortcut; 4],
+    active: &[bool; 4],
+) -> [NormalizedShortcut; 4] {
+    std::array::from_fn(|i| {
+        if active[i] {
+            values[i].clone()
+        } else {
+            NormalizedShortcut::Empty
+        }
+    })
+}
+
 /// Validate candidates while respecting an active field mask (e.g. inactive
 /// fields such as `shortcut2` when text strengthening is disabled do not
 /// participate in conflict detection, but explicitly changed fields are still
@@ -426,13 +443,7 @@ pub fn validate_candidates_with_active(
         }
     }
 
-    let conflict_values = std::array::from_fn(|i| {
-        if active[i] {
-            values[i].clone()
-        } else {
-            NormalizedShortcut::Empty
-        }
-    });
+    let conflict_values = effective_conflict_candidates(values, active);
     let graph = build_conflict_graph(&conflict_values);
     if let Some(pair) = graph.pairs.first() {
         let message = match pair.kind {
@@ -690,5 +701,69 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, "INVALID_SHORTCUT");
+    }
+
+    #[test]
+    fn disabled_secondary_alt_prefix_conflicts_are_ignored() {
+        // Slot 0 is AltRight, Slot 1 is Alt+A.
+        let values_slot0_altright = [
+            valid("AltRight"),
+            valid("Alt+A"),
+            NormalizedShortcut::Empty,
+            NormalizedShortcut::Empty,
+        ];
+        // When active[1] is false, prefix conflict is ignored
+        assert!(validate_candidates_with_active(
+            &values_slot0_altright,
+            &[true, false, false, false],
+            &[true, false, true, true]
+        )
+        .is_ok());
+        // When active[1] is true, prefix conflict is caught
+        assert!(validate_candidates_with_active(
+            &values_slot0_altright,
+            &[true, false, false, false],
+            &[true, true, true, true]
+        )
+        .is_err());
+
+        // Reverse: Slot 0 is Alt+A, Slot 1 is AltRight.
+        let values_slot1_altright = [
+            valid("Alt+A"),
+            valid("AltRight"),
+            NormalizedShortcut::Empty,
+            NormalizedShortcut::Empty,
+        ];
+        assert!(validate_candidates_with_active(
+            &values_slot1_altright,
+            &[true, false, false, false],
+            &[true, false, true, true]
+        )
+        .is_ok());
+        assert!(validate_candidates_with_active(
+            &values_slot1_altright,
+            &[true, false, false, false],
+            &[true, true, true, true]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn candidate_patch_resolves_conflict_during_reenable() {
+        // Current disk config has shortcut=F4 and shortcut2=F4 (duplicate).
+        // Candidate patch updates shortcut2 to F5 and enables strengthening.
+        let candidate_values = [
+            valid("F4"),
+            valid("F5"),
+            NormalizedShortcut::Empty,
+            NormalizedShortcut::Empty,
+        ];
+        // Validating with active[1]=true and changed[1]=true succeeds
+        assert!(validate_candidates_with_active(
+            &candidate_values,
+            &[false, true, false, false],
+            &[true, true, true, true]
+        )
+        .is_ok());
     }
 }

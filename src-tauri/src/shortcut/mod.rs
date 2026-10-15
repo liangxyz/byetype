@@ -488,7 +488,9 @@ impl ShortcutManager {
         let inner = self.lock_inner();
         let normalized: [NormalizedShortcut; 4] =
             std::array::from_fn(|i| inner.runtime[i].normalized.clone());
-        let graph = build_conflict_graph(&normalized);
+        let active = active_fields(&app_config);
+        let conflict_candidates = model::effective_conflict_candidates(&normalized, &active);
+        let graph = build_conflict_graph(&conflict_candidates);
         let mut line = format!(
             "[{}] backend={:?} schema={} ptt={} switching={} native_seen={} native_dispatched={} errors={:?}\n",
             phase,
@@ -639,13 +641,7 @@ impl ShortcutManager {
         let templates = shortcut_templates(&config);
         let normalized = normalized_from_values(&values);
         let active = active_fields(&config);
-        let conflict_candidates = std::array::from_fn(|i| {
-            if active[i] {
-                normalized[i].clone()
-            } else {
-                NormalizedShortcut::Empty
-            }
-        });
+        let conflict_candidates = model::effective_conflict_candidates(&normalized, &active);
         let graph = build_conflict_graph(&conflict_candidates);
         let fields = build_fields(&values, &normalized, &graph, &templates, &active);
 
@@ -673,11 +669,13 @@ impl ShortcutManager {
 
     // ---------- explicit field-level update ----------
 
-    fn update_shortcuts(
+    fn update_shortcut_settings(
         &self,
         app: &AppHandle,
         recorder: &Arc<AudioRecorder>,
         patch: &ShortcutPatch,
+        templates: &[String; 4],
+        text_strengthening_enabled: bool,
     ) -> Result<ShortcutUpdateResult, String> {
         self.ensure_dispatcher(app, recorder);
         let _guard = self.lock_update();
@@ -685,37 +683,43 @@ impl ShortcutManager {
         let config_manager = app.state::<ConfigManager>();
         let current = config_manager.get();
         let mut values = shortcut_values(&current);
-        let templates = shortcut_templates(&current);
         let mut changed = [false; 4];
 
         apply_patch_to_values(&mut values, &mut changed, patch);
 
         let normalized = normalized_from_values(&values);
-        let active = active_fields(&current);
-        model::validate_candidates_with_active(&normalized, &changed, &active).map_err(|error| {
-            format!("{}: {}", error.code, error.message)
-        })?;
+        let active = [true, text_strengthening_enabled, true, true];
+
+        // Newly activated fields must have valid syntax even if their string was not patched.
+        let newly_activated =
+            !current.general.text_strengthening_enabled && text_strengthening_enabled;
+        let syntax_check_mask = [
+            changed[0],
+            changed[1] || newly_activated,
+            changed[2],
+            changed[3],
+        ];
+
+        model::validate_candidates_with_active(&normalized, &syntax_check_mask, &active).map_err(
+            |error| format!("{}: {}", error.code, error.message),
+        )?;
 
         // On platforms without a native right-Alt backend an explicit AltRight
-        // save must fail rather than silently persist an unregistered value.
+        // save or activation must fail rather than silently persist an unregistered value.
         #[cfg(not(target_os = "windows"))]
         for index in 0..4 {
-            if changed[index] && normalized[index].canonical() == Some(ALT_RIGHT) {
+            if (changed[index] || (index == 1 && newly_activated))
+                && normalized[index].canonical() == Some(ALT_RIGHT)
+            {
                 return Err(
                     "ALT_RIGHT_BACKEND_FAILED: 当前平台不支持右 Alt 快捷键".to_string(),
                 );
             }
         }
 
-        let conflict_candidates = std::array::from_fn(|i| {
-            if active[i] {
-                normalized[i].clone()
-            } else {
-                NormalizedShortcut::Empty
-            }
-        });
+        let conflict_candidates = model::effective_conflict_candidates(&normalized, &active);
         let graph = build_conflict_graph(&conflict_candidates);
-        let fields = build_fields(&values, &normalized, &graph, &templates, &active);
+        let fields = build_fields(&values, &normalized, &graph, templates, &active);
 
         let old_fields = { self.lock_inner().runtime.clone() };
 
@@ -754,7 +758,7 @@ impl ShortcutManager {
             ));
         }
 
-        // Persist only the fields the user actually changed.
+        // Persist only the fields the user actually changed in the shortcut patch.
         let persist = build_persist_patch(&normalized, &changed);
         if !persist.is_empty() {
             if let Err(error) = config_manager.commit_shortcut_patch(&persist) {
@@ -816,8 +820,28 @@ pub fn update_shortcuts(
     recorder: Arc<AudioRecorder>,
     patch: ShortcutPatch,
 ) -> Result<ShortcutUpdateResult, String> {
+    let current = app.state::<ConfigManager>().get();
+    let templates = shortcut_templates(&current);
+    update_shortcut_settings(
+        app,
+        &recorder,
+        &patch,
+        &templates,
+        current.general.text_strengthening_enabled,
+    )
+}
+
+/// Explicit shortcut-domain settings update (keys, templates, strengthening).
+/// Operates under the domain lock with full validation and atomic rollback.
+pub fn update_shortcut_settings(
+    app: &AppHandle,
+    recorder: &Arc<AudioRecorder>,
+    patch: &ShortcutPatch,
+    templates: &[String; 4],
+    text_strengthening_enabled: bool,
+) -> Result<ShortcutUpdateResult, String> {
     let manager = app.state::<ShortcutManager>();
-    manager.update_shortcuts(app, &recorder, &patch)
+    manager.update_shortcut_settings(app, recorder, patch, templates, text_strengthening_enabled)
 }
 
 /// Platform default for 语音输入 1, used by the "reset shortcuts" action.
@@ -1352,29 +1376,22 @@ mod tests {
     #[test]
     fn strengthening_disabled_deactivates_shortcut2() {
         let values = [
-            "AltRight".to_string(),
-            "AltRight".to_string(),
+            "F4".to_string(),
+            "F5".to_string(),
             String::new(),
             String::new(),
         ];
         let normalized = normalized_from_values(&values);
         let active = [true, false, true, true];
-        let conflict_candidates = std::array::from_fn(|i| {
-            if active[i] {
-                normalized[i].clone()
-            } else {
-                NormalizedShortcut::Empty
-            }
-        });
+        let conflict_candidates = model::effective_conflict_candidates(&normalized, &active);
         let graph = build_conflict_graph(&conflict_candidates);
         let templates = std::array::from_fn(|_| String::new());
         let fields = build_fields(&values, &normalized, &graph, &templates, &active);
 
-        // slot 0 should be registered and use native alt-right
+        // slot 0 should be registered
         assert!(fields[0].registered);
-        assert!(fields[0].uses_native_alt_right);
 
-        // slot 1 (shortcut2) should NOT be registered, NOT use native alt-right, and have skip_reason
+        // slot 1 (shortcut2) should NOT be registered and have skip_reason
         assert!(!fields[1].registered);
         assert!(!fields[1].uses_native_alt_right);
         assert_eq!(
@@ -1390,6 +1407,65 @@ mod tests {
             result.per_field[1].error.as_deref(),
             Some("TEXT_STRENGTHENING_DISABLED: 文本强化已关闭")
         );
+    }
+
+    #[test]
+    fn alt_right_in_disabled_slot1_requires_no_native_backend() {
+        let values = [
+            "F4".to_string(),
+            "AltRight".to_string(),
+            String::new(),
+            String::new(),
+        ];
+        let normalized = normalized_from_values(&values);
+        let active = [true, false, true, true];
+        let conflict_candidates = model::effective_conflict_candidates(&normalized, &active);
+        let graph = build_conflict_graph(&conflict_candidates);
+        let templates = std::array::from_fn(|_| String::new());
+        let fields = build_fields(&values, &normalized, &graph, &templates, &active);
+
+        // slot 1 has AltRight on disk, but because strengthening is disabled,
+        // it must not register and must not request native AltRight backend.
+        assert!(!fields[1].registered);
+        assert!(!fields[1].uses_native_alt_right);
+
+        // No field requires native backend
+        assert!(!fields.iter().any(|f| f.registered && f.uses_native_alt_right));
+    }
+
+    #[test]
+    fn disabled_slot1_ignores_duplicate_and_prefix_conflicts() {
+        // Duplicate: slot 0 and slot 1 both F4
+        let values_dup = [
+            "F4".to_string(),
+            "F4".to_string(),
+            String::new(),
+            String::new(),
+        ];
+        let normalized_dup = normalized_from_values(&values_dup);
+        let active = [true, false, true, true];
+        let conflict_candidates = model::effective_conflict_candidates(&normalized_dup, &active);
+        let graph_dup = build_conflict_graph(&conflict_candidates);
+        let templates = std::array::from_fn(|_| String::new());
+        let fields_dup = build_fields(&values_dup, &normalized_dup, &graph_dup, &templates, &active);
+        assert!(fields_dup[0].registered);
+        assert!(!fields_dup[1].registered);
+
+        // Prefix: slot 0 is AltRight, slot 1 is Alt+A
+        let values_prefix = [
+            "AltRight".to_string(),
+            "Alt+A".to_string(),
+            String::new(),
+            String::new(),
+        ];
+        let normalized_prefix = normalized_from_values(&values_prefix);
+        let conflict_prefix = model::effective_conflict_candidates(&normalized_prefix, &active);
+        let graph_prefix = build_conflict_graph(&conflict_prefix);
+        let fields_prefix = build_fields(&values_prefix, &normalized_prefix, &graph_prefix, &templates, &active);
+        if is_windows() {
+            assert!(fields_prefix[0].registered);
+        }
+        assert!(!fields_prefix[1].registered);
     }
 
     #[test]

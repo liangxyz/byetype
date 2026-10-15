@@ -70,6 +70,12 @@ pub async fn save_config(
         )
         .then(|| config.general.extract_shortcut2.clone()),
     };
+    let templates = [
+        config.general.shortcut_template.clone(),
+        config.general.shortcut2_template.clone(),
+        config.general.extract_shortcut_template.clone(),
+        config.general.extract_shortcut2_template.clone(),
+    ];
     let templates_changed = config.general.shortcut_template
         != old_config.general.shortcut_template
         || config.general.shortcut2_template != old_config.general.shortcut2_template
@@ -79,37 +85,28 @@ pub async fn save_config(
             != old_config.general.extract_shortcut2_template;
     let strengthening_changed = config.general.text_strengthening_enabled
         != old_config.general.text_strengthening_enabled;
+    let shortcuts_need_update =
+        !shortcut_patch.is_empty() || templates_changed || strengthening_changed;
 
-    // 如果用户显式开启文本强化，必须检查当前配置的 shortcut2 是否会与其他快捷键产生冲突。
-    // 如果存在冲突，必须明确报错拒绝，避免静默进入“跳过冲突”状态。
-    if strengthening_changed && config.general.text_strengthening_enabled {
-        let current_config = config_manager.get();
-        let values = crate::shortcut::shortcut_values(&current_config);
-        let normalized = crate::shortcut::normalized_from_values(&values);
-        let graph = crate::shortcut::model::build_conflict_graph(&normalized);
-        if let Some(pair) = graph.pairs.into_iter().next() {
-            let message = match pair.kind {
-                crate::shortcut::model::ConflictKind::Duplicate => format!(
-                    "{} 与 {} 使用了相同的快捷键，请先调整快捷键再开启文本强化",
-                    pair.left.label(),
-                    pair.right.label()
-                ),
-                crate::shortcut::model::ConflictKind::AltPrefix => format!(
-                    "{} 与 {} 存在“右 Alt”前缀冲突，请先调整快捷键再开启文本强化",
-                    pair.left.label(),
-                    pair.right.label()
-                ),
-            };
-            return Err(format!("{}: {}", pair.kind.code(), message));
-        }
+    // 1. 如果快捷键、模板或文本强化开关有变动，先通过严格路径校验并执行运行时切换（带完整回滚保证）。
+    // 在快捷键域完全成功之前，严禁提前将 textStrengtheningEnabled 或快捷键改动写盘。
+    if shortcuts_need_update {
+        crate::shortcut::update_shortcut_settings(
+            &app,
+            &recorder,
+            &shortcut_patch,
+            &templates,
+            config.general.text_strengthening_enabled,
+        )?;
     }
 
-    // 用后端已确认的快捷键值构造基础配置，避免前端旧完整快照覆盖快捷键。
+    // 2. 用后端已确认的快捷键值构造基础配置，保存非快捷键配置。
+    let confirmed_config = config_manager.get();
     let mut base = config.clone();
-    base.general.shortcut = old_config.general.shortcut.clone();
-    base.general.shortcut2 = old_config.general.shortcut2.clone();
-    base.general.extract_shortcut = old_config.general.extract_shortcut.clone();
-    base.general.extract_shortcut2 = old_config.general.extract_shortcut2.clone();
+    base.general.shortcut = confirmed_config.general.shortcut;
+    base.general.shortcut2 = confirmed_config.general.shortcut2;
+    base.general.extract_shortcut = confirmed_config.general.extract_shortcut;
+    base.general.extract_shortcut2 = confirmed_config.general.extract_shortcut2;
 
     local_api_manager
         .configure(app.clone(), &config.local_api)
@@ -118,15 +115,41 @@ pub async fn save_config(
         let _ = local_api_manager
             .configure(app.clone(), &old_config.local_api)
             .await;
+        // 如果非快捷键配置写盘失败，且前面发生过快捷键变更，补偿回滚快捷键域
+        if shortcuts_need_update {
+            let rollback_templates = [
+                old_config.general.shortcut_template.clone(),
+                old_config.general.shortcut2_template.clone(),
+                old_config.general.extract_shortcut_template.clone(),
+                old_config.general.extract_shortcut2_template.clone(),
+            ];
+            let rollback_patch = crate::shortcut::ShortcutPatch {
+                shortcut: shortcut_patch
+                    .shortcut
+                    .is_some()
+                    .then(|| old_config.general.shortcut.clone()),
+                shortcut2: shortcut_patch
+                    .shortcut2
+                    .is_some()
+                    .then(|| old_config.general.shortcut2.clone()),
+                extract_shortcut: shortcut_patch
+                    .extract_shortcut
+                    .is_some()
+                    .then(|| old_config.general.extract_shortcut.clone()),
+                extract_shortcut2: shortcut_patch
+                    .extract_shortcut2
+                    .is_some()
+                    .then(|| old_config.general.extract_shortcut2.clone()),
+            };
+            let _ = crate::shortcut::update_shortcut_settings(
+                &app,
+                &recorder,
+                &rollback_patch,
+                &rollback_templates,
+                old_config.general.text_strengthening_enabled,
+            );
+        }
         return Err(error);
-    }
-
-    if !shortcut_patch.is_empty() {
-        // 显式快捷键变更：整次成功或整次回滚。
-        crate::shortcut::update_shortcuts(&app, recorder, shortcut_patch)?;
-    } else if templates_changed || strengthening_changed {
-        // 输出风格或文本强化开关变化需要重新注册。
-        crate::shortcut::register(&app, recorder)?;
     }
 
     Ok(true)
