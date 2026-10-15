@@ -669,7 +669,14 @@ impl ShortcutManager {
         self.commit_runtime(plan.fields.clone(), result);
         self.log_registration(app, "update");
 
-        Ok(build_update_result(&plan.fields, &plan.normalized, backend_kind, &plan.persist.keys))
+        Ok(build_update_result(
+            &plan.fields,
+            &plan.normalized,
+            &plan.templates,
+            plan.target_strengthening,
+            backend_kind,
+            &plan.persist.keys,
+        ))
     }
 }
 

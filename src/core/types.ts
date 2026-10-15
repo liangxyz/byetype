@@ -53,6 +53,11 @@ export interface ShortcutUpdateResult {
   shortcut2: string
   extractShortcut: string
   extractShortcut2: string
+  shortcutTemplate: string
+  shortcut2Template: string
+  extractShortcutTemplate: string
+  extractShortcut2Template: string
+  textStrengtheningEnabled: boolean
   altRightBackend: string | null
   perField: ShortcutFieldResult[]
 }

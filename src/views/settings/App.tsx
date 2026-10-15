@@ -11,7 +11,7 @@ import { ExtractPromptsTab } from './tabs/ExtractPromptsTab'
 import { StrengtheningPromptsTab } from './tabs/StrengtheningPromptsTab'
 import { BackupTab } from './tabs/BackupTab'
 import { VoiceLearningTab } from './tabs/VoiceLearningTab'
-import type { AppConfig, UpdateState, UpdateInfo, ShortcutPatch } from '../../core/types'
+import type { AppConfig, UpdateState, UpdateInfo, ShortcutPatch, ShortcutUpdateResult } from '../../core/types'
 import { getVersion } from '@tauri-apps/api/app'
 import { getConfig, saveConfig, onEvent, checkUpdate, updateShortcuts, resetShortcuts } from '../../lib/tauri-api'
 import './theme.css'
@@ -178,7 +178,7 @@ export function App() {
     }, 300)
   }, [])
 
-  const showShortcutResult = useCallback((result: { shortcut: string; shortcut2: string; extractShortcut: string; extractShortcut2: string }) => {
+  const showShortcutResult = useCallback((result: ShortcutUpdateResult) => {
     setConfig(prev => prev ? {
       ...prev,
       general: {
@@ -187,6 +187,11 @@ export function App() {
         shortcut2: result.shortcut2,
         extractShortcut: result.extractShortcut,
         extractShortcut2: result.extractShortcut2,
+        shortcutTemplate: result.shortcutTemplate,
+        shortcut2Template: result.shortcut2Template,
+        extractShortcutTemplate: result.extractShortcutTemplate,
+        extractShortcut2Template: result.extractShortcut2Template,
+        textStrengtheningEnabled: result.textStrengtheningEnabled,
       },
     } : prev)
     setSaved(true)

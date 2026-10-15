@@ -68,6 +68,11 @@ pub struct ShortcutUpdateResult {
     pub shortcut2: String,
     pub extract_shortcut: String,
     pub extract_shortcut2: String,
+    pub shortcut_template: String,
+    pub shortcut2_template: String,
+    pub extract_shortcut_template: String,
+    pub extract_shortcut2_template: String,
+    pub text_strengthening_enabled: bool,
     pub alt_right_backend: Option<String>,
     pub per_field: Vec<FieldResult>,
 }
@@ -171,6 +176,8 @@ pub fn build_fields(
 pub fn build_update_result(
     fields: &[FieldRuntime; 4],
     normalized: &[NormalizedShortcut; 4],
+    templates: &[String; 4],
+    text_strengthening_enabled: bool,
     backend_kind: Option<BackendKind>,
     persist_keys: &[(ShortcutField, String)],
 ) -> ShortcutUpdateResult {
@@ -203,6 +210,11 @@ pub fn build_update_result(
         shortcut2: confirmed(1),
         extract_shortcut: confirmed(2),
         extract_shortcut2: confirmed(3),
+        shortcut_template: templates[0].clone(),
+        shortcut2_template: templates[1].clone(),
+        extract_shortcut_template: templates[2].clone(),
+        extract_shortcut2_template: templates[3].clone(),
+        text_strengthening_enabled,
         alt_right_backend: backend_kind.map(|kind| kind.as_str().to_string()),
         per_field,
     }
@@ -328,18 +340,21 @@ where
     let mut result = register_fn(&plan.fields);
     if !result.errors.is_empty() {
         stop_backend_fn(&mut result.backend);
-        let teardown_err = teardown_fn().err();
+        if let Err(teardown_err) = teardown_fn() {
+            let mut all_errors = result.errors;
+            all_errors.push(teardown_err);
+            return Err(format!(
+                "SHORTCUT_ROLLBACK_FAILED: 新注册失败且注销清理失败: {}",
+                all_errors.join("; ")
+            ));
+        }
         let mut rollback = register_fn(old_fields);
-        if !rollback.errors.is_empty() || teardown_err.is_some() {
+        if !rollback.errors.is_empty() {
             stop_backend_fn(&mut rollback.backend);
             let _ = teardown_fn();
-            let mut all_errors = result.errors;
-            if let Some(te) = teardown_err {
-                all_errors.push(te);
-            }
             return Err(format!(
                 "SHORTCUT_ROLLBACK_FAILED: 新注册失败: {}; 回滚失败: {}",
-                all_errors.join("; "),
+                result.errors.join("; "),
                 rollback.errors.join("; ")
             ));
         }
@@ -353,18 +368,18 @@ where
     if !plan.persist.is_empty() {
         if let Err(error) = persist_fn(&plan.persist) {
             stop_backend_fn(&mut result.backend);
-            let teardown_err = teardown_fn().err();
+            if let Err(teardown_err) = teardown_fn() {
+                return Err(format!(
+                    "SHORTCUT_ROLLBACK_FAILED: 写盘失败且注销清理失败: {error}; {teardown_err}"
+                ));
+            }
             let mut rollback = register_fn(old_fields);
-            if !rollback.errors.is_empty() || teardown_err.is_some() {
+            if !rollback.errors.is_empty() {
                 stop_backend_fn(&mut rollback.backend);
                 let _ = teardown_fn();
-                let mut err_msg = error;
-                if let Some(te) = teardown_err {
-                    err_msg.push_str(&format!("; {te}"));
-                }
                 return Err(format!(
                     "SHORTCUT_ROLLBACK_FAILED: 写盘失败后回滚失败: {}; {}",
-                    err_msg,
+                    error,
                     rollback.errors.join("; ")
                 ));
             }
@@ -727,9 +742,11 @@ mod tests {
             Some("TEXT_STRENGTHENING_DISABLED: 文本强化已关闭")
         );
 
-        let result = build_update_result(&fields, &normalized, None, &[]);
+        let result = build_update_result(&fields, &normalized, &templates, false, None, &[]);
         assert!(result.per_field[0].registered);
         assert!(!result.per_field[1].registered);
+        assert_eq!(result.shortcut_template, "");
+        assert_eq!(result.text_strengthening_enabled, false);
         assert_eq!(
             result.per_field[1].error.as_deref(),
             Some("TEXT_STRENGTHENING_DISABLED: 文本强化已关闭")
@@ -840,6 +857,18 @@ mod tests {
         // Runtime reflects new registration
         assert!(result.registered[0], "Slot 0 must be registered");
         assert!(result.registered[1], "Slot 1 must now be registered because strengthening is true");
+
+        let update_res = build_update_result(
+            &plan.fields,
+            &plan.normalized,
+            &plan.templates,
+            plan.target_strengthening,
+            None,
+            &plan.persist.keys,
+        );
+        assert_eq!(update_res.shortcut, "F8");
+        assert_eq!(update_res.shortcut_template, "new-tpl");
+        assert_eq!(update_res.text_strengthening_enabled, true);
 
         // Disk reflects all changed domain fields together, while theme is preserved
         assert_eq!(raw_disk["general"]["shortcut"], "F8");
@@ -996,5 +1025,100 @@ mod tests {
         ).unwrap_err();
 
         assert!(err.contains("UNREGISTER_FAILED"));
+    }
+
+    #[test]
+    fn transaction_workflow_stops_partially_restored_backend_on_rollback_failure() {
+        let plan = plan_shortcut_transaction(
+            &["F4".to_string(), "F5".to_string(), "F6".to_string(), "".to_string()],
+            &std::array::from_fn(|_| "".to_string()),
+            true,
+            &ShortcutDomainPatch { shortcut: Some("F8".to_string()), ..Default::default() },
+            true,
+        ).unwrap();
+        let old_fields = std::array::from_fn(|i| FieldRuntime::empty(ShortcutField::ALL[i]));
+
+        let restored_drop_count = Arc::new(AtomicUsize::new(0));
+        let restored_drop_clone = restored_drop_count.clone();
+
+        let err = execute_transaction_workflow(
+            &plan,
+            &old_fields,
+            |fields| {
+                if fields[0].value == "F8" {
+                    RegistrationResult {
+                        errors: vec!["Initial registration failure".to_string()],
+                        ..Default::default()
+                    }
+                } else {
+                    let dc = restored_drop_clone.clone();
+                    let backend = native::make_backend(
+                        BackendKind::RawInput,
+                        Box::new(move || {
+                            dc.fetch_add(1, Ordering::SeqCst);
+                        }),
+                    );
+                    RegistrationResult {
+                        backend: Some(backend),
+                        errors: vec!["Partial rollback failure".to_string()],
+                        ..Default::default()
+                    }
+                }
+            },
+            || Ok(()),
+            |_| Ok(()),
+            |backend_opt| {
+                if let Some(mut backend) = backend_opt.take() {
+                    backend.stop();
+                }
+            },
+            |_| {},
+        ).unwrap_err();
+
+        assert!(err.contains("SHORTCUT_ROLLBACK_FAILED"));
+        assert_eq!(restored_drop_count.load(Ordering::SeqCst), 1, "Partially restored backend must be stopped on rollback failure");
+    }
+
+    #[test]
+    fn transaction_workflow_teardown_failure_prevents_subsequent_registration() {
+        let plan = plan_shortcut_transaction(
+            &["F4".to_string(), "F5".to_string(), "F6".to_string(), "".to_string()],
+            &std::array::from_fn(|_| "".to_string()),
+            true,
+            &ShortcutDomainPatch { shortcut: Some("F8".to_string()), ..Default::default() },
+            true,
+        ).unwrap();
+        let old_fields = std::array::from_fn(|i| FieldRuntime::empty(ShortcutField::ALL[i]));
+
+        let mut teardown_calls = 0;
+        let mut rollback_registered = false;
+        let err = execute_transaction_workflow(
+            &plan,
+            &old_fields,
+            |fields| {
+                if fields[0].value != "F8" {
+                    rollback_registered = true;
+                }
+                RegistrationResult {
+                    errors: vec!["Candidate failed".to_string()],
+                    ..Default::default()
+                }
+            },
+            || {
+                teardown_calls += 1;
+                if teardown_calls > 1 {
+                    Err("UNREGISTER_FAILED: Failed to unregister partial candidate".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| Ok(()),
+            |_| {},
+            |_| {},
+        ).unwrap_err();
+
+        assert!(err.contains("SHORTCUT_ROLLBACK_FAILED"));
+        assert!(err.contains("UNREGISTER_FAILED"));
+        assert!(!rollback_registered, "Restoration must never be attempted if unregistering candidate failed");
     }
 }
