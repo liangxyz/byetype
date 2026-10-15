@@ -111,13 +111,10 @@ pub struct RegistrationResult {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct TransactionPlan {
-    pub values: [String; 4],
     pub templates: [String; 4],
     pub normalized: [NormalizedShortcut; 4],
     pub target_strengthening: bool,
-    pub active: [bool; 4],
     pub fields: [FieldRuntime; 4],
     pub persist: ShortcutDomainPersist,
 }
@@ -310,11 +307,9 @@ pub fn plan_shortcut_transaction(
     }
 
     Ok(TransactionPlan {
-        values,
         templates,
         normalized,
         target_strengthening,
-        active,
         fields,
         persist,
     })
@@ -340,23 +335,32 @@ where
     let mut result = register_fn(&plan.fields);
     if !result.errors.is_empty() {
         stop_backend_fn(&mut result.backend);
-        if let Err(teardown_err) = teardown_fn() {
-            let mut all_errors = result.errors;
-            all_errors.push(teardown_err);
+        if let Err(first_cleanup_err) = teardown_fn() {
+            // Teardown of partial candidate failed. Never register old set into uncertain state!
+            let retry_err = teardown_fn().err();
+            let mut errs = result.errors;
+            errs.push(first_cleanup_err);
+            if let Some(re) = retry_err {
+                errs.push(re);
+            }
             return Err(format!(
-                "SHORTCUT_ROLLBACK_FAILED: 新注册失败且注销清理失败: {}",
-                all_errors.join("; ")
+                "SHORTCUT_ROLLBACK_FAILED: 新注册失败且注销清理失败（放弃恢复注册以防状态污染）: {}",
+                errs.join("; ")
             ));
         }
         let mut rollback = register_fn(old_fields);
         if !rollback.errors.is_empty() {
             stop_backend_fn(&mut rollback.backend);
-            let _ = teardown_fn();
-            return Err(format!(
+            let final_cleanup = teardown_fn().err();
+            let mut msg = format!(
                 "SHORTCUT_ROLLBACK_FAILED: 新注册失败: {}; 回滚失败: {}",
                 result.errors.join("; "),
                 rollback.errors.join("; ")
-            ));
+            );
+            if let Some(fc) = final_cleanup {
+                msg.push_str(&format!("; 最终清理失败: {fc}"));
+            }
+            return Err(msg);
         }
         install_restored_fn(rollback);
         return Err(format!(
@@ -368,20 +372,29 @@ where
     if !plan.persist.is_empty() {
         if let Err(error) = persist_fn(&plan.persist) {
             stop_backend_fn(&mut result.backend);
-            if let Err(teardown_err) = teardown_fn() {
-                return Err(format!(
-                    "SHORTCUT_ROLLBACK_FAILED: 写盘失败且注销清理失败: {error}; {teardown_err}"
-                ));
+            if let Err(first_cleanup_err) = teardown_fn() {
+                let retry_err = teardown_fn().err();
+                let mut msg = format!(
+                    "SHORTCUT_ROLLBACK_FAILED: 写盘失败后注销清理失败: {error}; {first_cleanup_err}"
+                );
+                if let Some(re) = retry_err {
+                    msg.push_str(&format!("; {re}"));
+                }
+                return Err(msg);
             }
             let mut rollback = register_fn(old_fields);
             if !rollback.errors.is_empty() {
                 stop_backend_fn(&mut rollback.backend);
-                let _ = teardown_fn();
-                return Err(format!(
+                let final_cleanup = teardown_fn().err();
+                let mut msg = format!(
                     "SHORTCUT_ROLLBACK_FAILED: 写盘失败后回滚失败: {}; {}",
                     error,
                     rollback.errors.join("; ")
-                ));
+                );
+                if let Some(fc) = final_cleanup {
+                    msg.push_str(&format!("; 最终清理失败: {fc}"));
+                }
+                return Err(msg);
             }
             install_restored_fn(rollback);
             return Err(error);
@@ -467,7 +480,7 @@ mod tests {
         .expect("plan should resolve duplicate conflict");
 
         assert_eq!(plan.target_strengthening, true);
-        assert_eq!(plan.values[1], "F5");
+        assert_eq!(plan.fields[1].value, "F5");
         assert_eq!(plan.persist.keys, vec![(ShortcutField::Shortcut2, "F5".to_string())]);
         assert_eq!(plan.persist.text_strengthening_enabled, Some(true));
     }
@@ -1120,5 +1133,157 @@ mod tests {
         assert!(err.contains("SHORTCUT_ROLLBACK_FAILED"));
         assert!(err.contains("UNREGISTER_FAILED"));
         assert!(!rollback_registered, "Restoration must never be attempted if unregistering candidate failed");
+    }
+
+    #[test]
+    fn transaction_workflow_cleanup_retry_clears_partial_registrations_when_successful() {
+        let plan = plan_shortcut_transaction(
+            &["F4".to_string(), "F5".to_string(), "F6".to_string(), "".to_string()],
+            &std::array::from_fn(|_| "".to_string()),
+            true,
+            &ShortcutDomainPatch { shortcut: Some("F8".to_string()), ..Default::default() },
+            true,
+        ).unwrap();
+        let old_fields = std::array::from_fn(|i| FieldRuntime::empty(ShortcutField::ALL[i]));
+
+        let mut teardown_calls = 0;
+        let mut partial_map_cleared = false;
+
+        let err = execute_transaction_workflow(
+            &plan,
+            &old_fields,
+            |_| {
+                RegistrationResult {
+                    errors: vec!["Candidate registration error".to_string()],
+                    ..Default::default()
+                }
+            },
+            || {
+                teardown_calls += 1;
+                if teardown_calls == 2 {
+                    // First candidate teardown fails
+                    Err("First teardown failed".to_string())
+                } else if teardown_calls == 3 {
+                    // Retry teardown succeeds
+                    partial_map_cleared = true;
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| Ok(()),
+            |_| {},
+            |_| {},
+        ).unwrap_err();
+
+        assert!(err.contains("SHORTCUT_ROLLBACK_FAILED"));
+        assert!(partial_map_cleared, "Retry teardown must clear partial registrations");
+        assert_eq!(teardown_calls, 3);
+    }
+
+    #[test]
+    fn transaction_workflow_repeated_cleanup_failure_is_reported() {
+        let plan = plan_shortcut_transaction(
+            &["F4".to_string(), "F5".to_string(), "F6".to_string(), "".to_string()],
+            &std::array::from_fn(|_| "".to_string()),
+            true,
+            &ShortcutDomainPatch { shortcut: Some("F8".to_string()), ..Default::default() },
+            true,
+        ).unwrap();
+        let old_fields = std::array::from_fn(|i| FieldRuntime::empty(ShortcutField::ALL[i]));
+
+        let mut teardown_calls = 0;
+
+        let err = execute_transaction_workflow(
+            &plan,
+            &old_fields,
+            |_| {
+                RegistrationResult {
+                    errors: vec!["Candidate error".to_string()],
+                    ..Default::default()
+                }
+            },
+            || {
+                teardown_calls += 1;
+                if teardown_calls > 1 {
+                    Err(format!("Cleanup error #{teardown_calls}"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| Ok(()),
+            |_| {},
+            |_| {},
+        ).unwrap_err();
+
+        assert!(err.contains("SHORTCUT_ROLLBACK_FAILED"));
+        assert!(err.contains("Cleanup error #2"));
+        assert!(err.contains("Cleanup error #3"));
+    }
+
+    #[test]
+    fn transaction_workflow_stops_partially_restored_backend_and_cleans_map() {
+        use std::sync::Mutex;
+
+        let plan = plan_shortcut_transaction(
+            &["F4".to_string(), "F5".to_string(), "F6".to_string(), "".to_string()],
+            &std::array::from_fn(|_| "".to_string()),
+            true,
+            &ShortcutDomainPatch { shortcut: Some("F8".to_string()), ..Default::default() },
+            true,
+        ).unwrap();
+        let old_fields = std::array::from_fn(|i| FieldRuntime::empty(ShortcutField::ALL[i]));
+
+        let restored_drop_count = Arc::new(AtomicUsize::new(0));
+        let restored_drop_clone = restored_drop_count.clone();
+        let final_cleanup_called = Arc::new(AtomicUsize::new(0));
+        let final_cleanup_clone = final_cleanup_called.clone();
+        let final_registered_map = Arc::new(Mutex::new([false; 4]));
+        let final_map_reg = final_registered_map.clone();
+        let final_map_clean = final_registered_map.clone();
+
+        let err = execute_transaction_workflow(
+            &plan,
+            &old_fields,
+            |fields| {
+                if fields[0].value == "F8" {
+                    RegistrationResult {
+                        errors: vec!["Initial failure".to_string()],
+                        ..Default::default()
+                    }
+                } else {
+                    let dc = restored_drop_clone.clone();
+                    let backend = native::make_backend(
+                        BackendKind::RawInput,
+                        Box::new(move || {
+                            dc.fetch_add(1, Ordering::SeqCst);
+                        }),
+                    );
+                    final_map_reg.lock().unwrap()[0] = true;
+                    RegistrationResult {
+                        backend: Some(backend),
+                        errors: vec!["Partial rollback failure".to_string()],
+                        ..Default::default()
+                    }
+                }
+            },
+            || {
+                final_cleanup_clone.fetch_add(1, Ordering::SeqCst);
+                *final_map_clean.lock().unwrap() = [false; 4];
+                Ok(())
+            },
+            |_| Ok(()),
+            |backend_opt| {
+                if let Some(mut backend) = backend_opt.take() {
+                    backend.stop();
+                }
+            },
+            |_| {},
+        ).unwrap_err();
+
+        assert!(err.contains("SHORTCUT_ROLLBACK_FAILED"));
+        assert_eq!(restored_drop_count.load(Ordering::SeqCst), 1, "Partially restored backend must be stopped");
+        assert!(final_cleanup_called.load(Ordering::SeqCst) > 0, "Final cleanup teardown must be called");
+        assert_eq!(*final_registered_map.lock().unwrap(), [false; 4], "Registration map must be cleared on rollback failure");
     }
 }
