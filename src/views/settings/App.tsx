@@ -12,6 +12,7 @@ import { StrengtheningPromptsTab } from './tabs/StrengtheningPromptsTab'
 import { BackupTab } from './tabs/BackupTab'
 import { VoiceLearningTab } from './tabs/VoiceLearningTab'
 import type { AppConfig, UpdateState, UpdateInfo, ShortcutPatch, ShortcutUpdateResult } from '../../core/types'
+import { mergeConfirmedShortcutDomain } from '../../core/shortcut-domain'
 import { getVersion } from '@tauri-apps/api/app'
 import { getConfig, saveConfig, onEvent, checkUpdate, updateShortcuts, resetShortcuts } from '../../lib/tauri-api'
 import './theme.css'
@@ -181,18 +182,7 @@ export function App() {
   const showShortcutResult = useCallback((result: ShortcutUpdateResult) => {
     setConfig(prev => prev ? {
       ...prev,
-      general: {
-        ...prev.general,
-        shortcut: result.shortcut,
-        shortcut2: result.shortcut2,
-        extractShortcut: result.extractShortcut,
-        extractShortcut2: result.extractShortcut2,
-        shortcutTemplate: result.shortcutTemplate,
-        shortcut2Template: result.shortcut2Template,
-        extractShortcutTemplate: result.extractShortcutTemplate,
-        extractShortcut2Template: result.extractShortcut2Template,
-        textStrengtheningEnabled: result.textStrengtheningEnabled,
-      },
+      general: mergeConfirmedShortcutDomain(prev.general, result),
     } : prev)
     setSaved(true)
     setTimeout(() => setSaved(false), 1500)

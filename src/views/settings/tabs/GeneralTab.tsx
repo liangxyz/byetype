@@ -19,6 +19,7 @@ import { SettingGroup } from '../components/SettingGroup'
 import { SettingRow } from '../components/SettingRow'
 import { Toggle } from '../components/Toggle'
 import { ShortcutInput } from '../components/ShortcutInput'
+import { computeStrengtheningPatch } from '../../../core/shortcut-domain'
 
 /** 语音入口固定名称，不再允许自定义 */
 const VOICE_PLAIN_LABEL = '语音输入'
@@ -194,18 +195,18 @@ export function GeneralTab({ config, onSave, onShortcutChange, onResetShortcuts 
   }
 
   // 开关通过快捷键域专属通道保存，不改任何未指定的模板选择与快捷键；
-  // 旧配置里「输出风格选无」存的是空模板，打开时补一个可用默认项。
+  // 仅在当前模板绑定为空时补充可用默认项，已有非空绑定绝不重复发送。
   const setStrengthening = async (enabled: boolean) => {
     try {
-      await onShortcutChange({
-        textStrengtheningEnabled: enabled,
-        shortcutTemplate: enabled
-          ? config.general.shortcutTemplate || voiceTemplates[0]?.id || ''
-          : undefined,
-        shortcut2Template: enabled
-          ? config.general.shortcut2Template || voiceTemplates[1]?.id || voiceTemplates[0]?.id || ''
-          : undefined,
-      })
+      const patch = computeStrengtheningPatch(
+        enabled,
+        {
+          shortcutTemplate: config.general.shortcutTemplate,
+          shortcut2Template: config.general.shortcut2Template,
+        },
+        voiceTemplates,
+      )
+      await onShortcutChange(patch)
     } catch (error: unknown) {
       showShortcutError(
         typeof error === 'string'

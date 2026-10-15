@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { AppConfig, ShortcutPatch, TemplateEntry } from '../../../core/types'
 import { PromptEditor } from './PromptEditor'
 import { createUserPromptFile, updateShortcuts } from '../../../lib/tauri-api'
+import { mergeConfirmedShortcutDomain } from '../../../core/shortcut-domain'
 
 type TemplateKind = 'voice' | 'image'
 
@@ -84,6 +85,7 @@ export function TemplatePromptsPanel({ kind, config, onSave }: Props) {
 
   // 删除自定义模板时，把指向它的快捷键绑定改到保留的模板上，
   // 避免界面显示一个模板、后端却按已删除的模板执行。
+  // 必须严格执行 Fail-Closed：若绑定重定向失败，严禁删除模板或更改选择。
   const deleteTemplate = async () => {
     const remaining = templates.filter(t => t.id !== current.id)
     const fallback = remaining[0]?.id ?? ''
@@ -91,17 +93,27 @@ export function TemplatePromptsPanel({ kind, config, onSave }: Props) {
     if (kind === 'voice') {
       if (config.general.shortcutTemplate === current.id) patch.shortcutTemplate = fallback
       if (config.general.shortcut2Template === current.id) patch.shortcut2Template = fallback
-      if (Object.keys(patch).length > 0) {
-        await updateShortcuts(patch).catch(e => console.error('Failed to update shortcut template binding:', e))
-      }
-      onSave({ ...config, voiceTemplates: { ...config.voiceTemplates, templates: remaining } })
     } else {
       if (config.general.extractShortcutTemplate === current.id) patch.extractShortcutTemplate = fallback
       if (config.general.extractShortcut2Template === current.id) patch.extractShortcut2Template = fallback
-      if (Object.keys(patch).length > 0) {
-        await updateShortcuts(patch).catch(e => console.error('Failed to update extract shortcut template binding:', e))
+    }
+
+    let updatedGeneral = config.general
+    if (Object.keys(patch).length > 0) {
+      try {
+        const confirmed = await updateShortcuts(patch)
+        updatedGeneral = mergeConfirmedShortcutDomain(config.general, confirmed)
+      } catch (e: any) {
+        const errorMsg = typeof e === 'string' ? e : e?.message || '更新快捷键绑定失败'
+        alert(`删除模板失败：无法更新关联的快捷键绑定（${errorMsg}），已取消删除。`)
+        return
       }
-      onSave({ ...config, extract: { ...config.extract, templates: remaining } })
+    }
+
+    if (kind === 'voice') {
+      onSave({ ...config, general: updatedGeneral, voiceTemplates: { ...config.voiceTemplates, templates: remaining } })
+    } else {
+      onSave({ ...config, general: updatedGeneral, extract: { ...config.extract, templates: remaining } })
     }
     setSelectedId(remaining[0]?.id ?? '')
   }
