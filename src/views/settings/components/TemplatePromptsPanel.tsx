@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { AppConfig, ShortcutUpdateResult, TemplateEntry } from '../../../core/types'
 import { PromptEditor } from './PromptEditor'
 import { createUserPromptFile, updateShortcuts } from '../../../lib/tauri-api'
-import { executeTemplateDeletion, mergeConfirmedShortcutDomain } from '../../../core/shortcut-domain'
+import { executeTemplateDeletion } from '../../../core/shortcut-domain'
 
 type TemplateKind = 'voice' | 'image'
 
@@ -25,7 +25,7 @@ interface Props {
   kind: TemplateKind
   config: AppConfig
   onSave: (config: AppConfig) => void
-  onDeleteTemplate?: (
+  onDeleteTemplate: (
     kind: TemplateKind,
     deletedId: string,
     confirmedDomain?: ShortcutUpdateResult,
@@ -99,21 +99,7 @@ export function TemplatePromptsPanel({ kind, config, onSave, onDeleteTemplate }:
       general: config.general,
       updateShortcutsFn: updateShortcuts,
       onSuccess: ({ deletedId, fallbackId, confirmedDomain }) => {
-        if (onDeleteTemplate) {
-          onDeleteTemplate(kind, deletedId, confirmedDomain)
-        } else {
-          const remaining = templates.filter(t => t.id !== deletedId)
-          const general = confirmedDomain
-            ? mergeConfirmedShortcutDomain(config.general, confirmedDomain)
-            : config.general
-          onSave({
-            ...config,
-            general,
-            ...(kind === 'voice'
-              ? { voiceTemplates: { ...config.voiceTemplates, templates: remaining } }
-              : { extract: { ...config.extract, templates: remaining } }),
-          })
-        }
+        onDeleteTemplate(kind, deletedId, confirmedDomain)
         setSelectedId(fallbackId)
       },
       onError: (msg) => {

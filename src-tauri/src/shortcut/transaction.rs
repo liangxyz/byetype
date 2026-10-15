@@ -316,6 +316,33 @@ pub fn plan_shortcut_transaction(
     })
 }
 
+pub fn perform_targeted_cleanup<F>(
+    keys_to_clean: &[String],
+    owned_ledger: &mut std::collections::HashSet<String>,
+    mut unregister_key_fn: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str) -> Result<(), String>,
+{
+    let mut errors = Vec::new();
+    for key in keys_to_clean {
+        match unregister_key_fn(key) {
+            Ok(()) => {
+                owned_ledger.remove(key);
+            }
+            Err(e) => {
+                owned_ledger.insert(key.clone());
+                errors.push(format!("{key}: {e}"));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("UNREGISTER_FAILED: 无法注销快捷键: {}", errors.join("; ")))
+    }
+}
+
 pub fn execute_transaction_workflow<R, P, B, S, T>(
     plan: &TransactionPlan,
     old_fields: &[FieldRuntime; 4],
@@ -1378,5 +1405,95 @@ mod tests {
         // Targeted check detected the OS unregistration failure despite unregister_all having drained
         assert!(err.contains("SHORTCUT_ROLLBACK_FAILED"));
         assert!(err.contains("OS failed to unregister F8"));
+    }
+
+    #[test]
+    fn targeted_cleanup_preserves_os_ledger_across_plugin_map_drain_and_retries() {
+        // Three-layer fake:
+        // 1. plugin_bookkeeping: what plugin thinks is registered (drained on unregister_all)
+        // 2. os_registrations: what OS actually holds
+        // 3. fail_keys: keys for which OS unregistration fails
+        struct ThreeLayerPluginFake {
+            plugin_bookkeeping: HashSet<String>,
+            os_registrations: HashSet<String>,
+            fail_keys: HashSet<String>,
+        }
+
+        impl ThreeLayerPluginFake {
+            fn unregister_key(&mut self, key: &str) -> Result<(), String> {
+                if self.fail_keys.contains(key) {
+                    Err(format!("OS failure unregistering {key}"))
+                } else {
+                    self.plugin_bookkeeping.remove(key);
+                    self.os_registrations.remove(key);
+                    Ok(())
+                }
+            }
+
+            fn simulate_unregister_all_draining_bug(&mut self) -> Result<(), String> {
+                let drained = std::mem::take(&mut self.plugin_bookkeeping);
+                for key in drained {
+                    if self.fail_keys.contains(&key) {
+                        return Err(format!("OS failed: {key}"));
+                    } else {
+                        self.os_registrations.remove(&key);
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        let mut fake = ThreeLayerPluginFake {
+            plugin_bookkeeping: ["F8".to_string(), "F9".to_string()].into_iter().collect(),
+            os_registrations: ["F8".to_string(), "F9".to_string()].into_iter().collect(),
+            fail_keys: ["F8".to_string()].into_iter().collect(), // F8 will fail unregistering
+        };
+
+        let mut owned_ledger: HashSet<String> = ["F8".to_string(), "F9".to_string()].into_iter().collect();
+
+        // 1. Initial targeted cleanup: F9 succeeds, F8 fails
+        let keys_to_clean = vec!["F8".to_string(), "F9".to_string()];
+        let err = perform_targeted_cleanup(
+            &keys_to_clean,
+            &mut owned_ledger,
+            |k| fake.unregister_key(k),
+        ).unwrap_err();
+
+        assert!(err.contains("F8"));
+        // F9 was cleared from OS and ledger
+        assert!(!fake.os_registrations.contains("F9"));
+        assert!(!owned_ledger.contains("F9"));
+        // F8 failed: retained in OS and retained in owned_ledger!
+        assert!(fake.os_registrations.contains("F8"));
+        assert!(owned_ledger.contains("F8"), "Failed key must be retained in ledger!");
+
+        // 2. Simulate plugin draining bug happening in background
+        let _ = fake.simulate_unregister_all_draining_bug();
+        assert!(fake.plugin_bookkeeping.is_empty(), "Plugin bookkeeping was emptied by bug");
+        assert!(fake.os_registrations.contains("F8"), "OS still holds F8!");
+
+        // 3. Ledger still remembers F8! Retry targeted cleanup while failure persists:
+        let retry_keys: Vec<String> = owned_ledger.iter().cloned().collect();
+        assert_eq!(retry_keys, vec!["F8".to_string()]);
+        let err_retry = perform_targeted_cleanup(
+            &retry_keys,
+            &mut owned_ledger,
+            |k| fake.unregister_key(k),
+        ).unwrap_err();
+        assert!(err_retry.contains("F8"));
+        assert!(owned_ledger.contains("F8"), "Still retained across repeated failure");
+
+        // 4. Resolve the OS failure (e.g. key lock released) and retry:
+        fake.fail_keys.clear();
+        let retry_success_keys: Vec<String> = owned_ledger.iter().cloned().collect();
+        let ok = perform_targeted_cleanup(
+            &retry_success_keys,
+            &mut owned_ledger,
+            |k| fake.unregister_key(k),
+        );
+        assert!(ok.is_ok());
+        // Now F8 is completely cleared from OS and ledger!
+        assert!(!fake.os_registrations.contains("F8"));
+        assert!(owned_ledger.is_empty());
     }
 }

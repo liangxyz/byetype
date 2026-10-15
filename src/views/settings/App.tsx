@@ -12,7 +12,7 @@ import { StrengtheningPromptsTab } from './tabs/StrengtheningPromptsTab'
 import { BackupTab } from './tabs/BackupTab'
 import { VoiceLearningTab } from './tabs/VoiceLearningTab'
 import type { AppConfig, UpdateState, UpdateInfo, ShortcutPatch, ShortcutUpdateResult } from '../../core/types'
-import { mergeConfirmedShortcutDomain } from '../../core/shortcut-domain'
+import { applyTemplateDeletionCompletion, mergeConfirmedShortcutDomain } from '../../core/shortcut-domain'
 import { getVersion } from '@tauri-apps/api/app'
 import { getConfig, saveConfig, onEvent, checkUpdate, updateShortcuts, resetShortcuts } from '../../lib/tauri-api'
 import './theme.css'
@@ -53,6 +53,10 @@ const INITIAL_UPDATE_STATE: UpdateState = {
 export function App() {
   const [activeTab, setActiveTab] = useState('general')
   const [config, setConfig] = useState<AppConfig | null>(null)
+  const configRef = useRef<AppConfig | null>(null)
+  useEffect(() => {
+    configRef.current = config
+  }, [config])
   const [saved, setSaved] = useState(false)
   const [errorMsg, setErrorMsg] = useState('')
   const [updateState, setUpdateState] = useState<UpdateState>(INITIAL_UPDATE_STATE)
@@ -221,22 +225,15 @@ export function App() {
     deletedId: string,
     confirmedDomain?: ShortcutUpdateResult,
   ) => {
-    setConfig(prev => {
-      if (!prev) return prev
-      let general = prev.general
-      if (confirmedDomain) {
-        general = mergeConfirmedShortcutDomain(general, confirmedDomain)
-      }
-      const updated = {
-        ...prev,
-        general,
-        ...(kind === 'voice'
-          ? { voiceTemplates: { ...prev.voiceTemplates, templates: prev.voiceTemplates.templates.filter(t => t.id !== deletedId) } }
-          : { extract: { ...prev.extract, templates: prev.extract.templates.filter(t => t.id !== deletedId) } }),
-      }
-      handleSave(updated)
-      return updated
+    const latest = configRef.current
+    if (!latest) return
+    const updated = applyTemplateDeletionCompletion(latest, {
+      kind,
+      deletedId,
+      confirmedDomain,
     })
+    setConfig(updated)
+    handleSave(updated)
   }, [handleSave])
 
   const showDot = updateState.phase === 'available' && !updateState.dismissed

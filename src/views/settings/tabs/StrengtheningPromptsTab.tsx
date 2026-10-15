@@ -4,7 +4,7 @@ import { TemplatePromptsPanel } from '../components/TemplatePromptsPanel'
 interface Props {
   config: AppConfig
   onSave: (config: AppConfig) => void
-  onDeleteTemplate?: (
+  onDeleteTemplate: (
     kind: 'voice' | 'image',
     deletedId: string,
     confirmedDomain?: ShortcutUpdateResult,

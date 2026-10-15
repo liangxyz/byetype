@@ -1,12 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert'
 import {
+  applyTemplateDeletionCompletion,
   computeStrengtheningPatch,
   executeTemplateDeletion,
   mergeConfirmedShortcutDomain,
   planTemplateDeletionReassignment,
 } from '../src/core/shortcut-domain.ts'
-import type { GeneralConfig, ShortcutUpdateResult } from '../src/core/types.ts'
+import type { AppConfig, GeneralConfig, ShortcutUpdateResult } from '../src/core/types.ts'
 
 test('enabling with nonempty bindings emits only strengthening flag', () => {
   const patch = computeStrengtheningPatch(
@@ -137,73 +138,79 @@ test('template deletion fails closed on reassignment rejection (real executeTemp
   assert.ok(errorMessage?.includes('OS Registration Error'))
 })
 
-test('template deletion success preserves newer concurrent edits in latest state', async () => {
+test('template deletion success preserves newer concurrent edits in latest state via applyTemplateDeletionCompletion', async () => {
   const templates = [
     { id: 'custom-to-delete', name: 'Custom' },
     { id: 'fallback-1', name: 'Fallback' },
   ]
 
-  // State when user clicked delete
-  const initialGeneral: GeneralConfig = {
-    theme: 'light',
-    microphone: 'mic-old',
-    launchAtLogin: false,
-    shortcut: 'AltRight',
-    shortcut2: '',
-    extractShortcut: 'F6',
-    extractShortcut2: '',
-    shortcutTemplate: 'custom-to-delete',
-    shortcut2Template: 'other',
-    extractShortcutTemplate: '',
-    extractShortcut2Template: '',
-    maxRecordingSeconds: 60,
-    overwriteClipboard: true,
-    textStrengtheningEnabled: true,
+  const initialConfig: AppConfig = {
+    general: {
+      theme: 'light',
+      microphone: 'mic-old',
+      launchAtLogin: false,
+      shortcut: 'AltRight',
+      shortcut2: '',
+      extractShortcut: 'F6',
+      extractShortcut2: '',
+      shortcutTemplate: 'custom-to-delete',
+      shortcut2Template: 'other',
+      extractShortcutTemplate: '',
+      extractShortcut2Template: '',
+      maxRecordingSeconds: 60,
+      overwriteClipboard: true,
+      textStrengtheningEnabled: true,
+    },
+    voiceTemplates: { templates },
+    models: {} as any,
+    localApi: {} as any,
+    transcribe: {} as any,
+    voiceLearning: {} as any,
+    extract: { templates: [] },
+    advanced: {} as any,
   }
 
   // Live state updated concurrently while reassignment was in flight
-  let liveState = {
+  let liveConfig: AppConfig = {
+    ...initialConfig,
     general: {
-      ...initialGeneral,
+      ...initialConfig.general,
       theme: 'dark', // Concurrently edited!
       microphone: 'mic-new', // Concurrently edited!
     },
-    voiceTemplates: { templates },
+    voiceTemplates: {
+      templates: [
+        ...templates,
+        { id: 'concurrently-added', name: 'Concurrently Added' },
+      ],
+    },
   }
 
   const success = await executeTemplateDeletion({
     kind: 'voice',
     currentId: 'custom-to-delete',
     templates,
-    general: initialGeneral,
-    updateShortcutsFn: async (_patch) => {
-      return {
-        shortcut: 'AltRight',
-        shortcut2: '',
-        extractShortcut: 'F6',
-        extractShortcut2: '',
-        shortcutTemplate: 'fallback-1',
-        shortcut2Template: 'other',
-        extractShortcutTemplate: '',
-        extractShortcut2Template: '',
-        textStrengtheningEnabled: true,
-        altRightBackend: 'raw_input',
-        perField: [],
-      }
-    },
+    general: initialConfig.general,
+    updateShortcutsFn: async () => ({
+      shortcut: 'AltRight',
+      shortcut2: '',
+      extractShortcut: 'F6',
+      extractShortcut2: '',
+      shortcutTemplate: 'fallback-1',
+      shortcut2Template: 'other',
+      extractShortcutTemplate: '',
+      extractShortcut2Template: '',
+      textStrengtheningEnabled: true,
+      altRightBackend: 'raw_input',
+      perField: [],
+    }),
     onSuccess: ({ deletedId, fallbackId, confirmedDomain }) => {
-      // In App.tsx, composition uses the latest liveState!
-      let general = liveState.general
-      if (confirmedDomain) {
-        general = mergeConfirmedShortcutDomain(general, confirmedDomain)
-      }
-      liveState = {
-        ...liveState,
-        general,
-        voiceTemplates: {
-          templates: liveState.voiceTemplates.templates.filter(t => t.id !== deletedId),
-        },
-      }
+      // In production App.tsx, composition calls applyTemplateDeletionCompletion with latest config
+      liveConfig = applyTemplateDeletionCompletion(liveConfig, {
+        kind: 'voice',
+        deletedId,
+        confirmedDomain,
+      })
       assert.strictEqual(fallbackId, 'fallback-1')
     },
     onError: () => {},
@@ -211,10 +218,12 @@ test('template deletion success preserves newer concurrent edits in latest state
 
   assert.strictEqual(success, true)
   // Preserved newer concurrent edits!
-  assert.strictEqual(liveState.general.theme, 'dark', 'Newer theme edit must be preserved')
-  assert.strictEqual(liveState.general.microphone, 'mic-new', 'Newer microphone edit must be preserved')
-  // Confirmed fallback template was applied
-  assert.strictEqual(liveState.general.shortcutTemplate, 'fallback-1')
-  // Template list removed deleted template
-  assert.strictEqual(liveState.voiceTemplates.templates.length, 1)
+  assert.strictEqual(liveConfig.general.theme, 'dark', 'Newer theme edit must be preserved')
+  assert.strictEqual(liveConfig.general.microphone, 'mic-new', 'Newer microphone edit must be preserved')
+  // Concurrently added template is preserved!
+  assert.ok(liveConfig.voiceTemplates.templates.some(t => t.id === 'concurrently-added'), 'Concurrently added template must survive')
+  // Deleted template was removed!
+  assert.ok(!liveConfig.voiceTemplates.templates.some(t => t.id === 'custom-to-delete'), 'Deleted template must be removed')
+  // Confirmed fallback template was applied!
+  assert.strictEqual(liveConfig.general.shortcutTemplate, 'fallback-1')
 })

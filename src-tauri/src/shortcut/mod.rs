@@ -92,7 +92,7 @@ struct Inner {
     alt_right_backend: Option<native::AltRightBackend>,
     backend_kind: Option<BackendKind>,
     last_registration_errors: Vec<String>,
-    registered_tauri_keys: Vec<String>,
+    owned_hotkeys: std::collections::HashSet<String>,
     native_events_seen: u64,
     native_events_dispatched: u64,
     voice_slots: [Arc<VoiceSlot>; 2],
@@ -140,7 +140,7 @@ impl ShortcutManager {
                 alt_right_backend: None,
                 backend_kind: None,
                 last_registration_errors: Vec::new(),
-                registered_tauri_keys: Vec::new(),
+                owned_hotkeys: std::collections::HashSet::new(),
                 native_events_seen: 0,
                 native_events_dispatched: 0,
                 voice_slots: [Arc::new(VoiceSlot::default()), Arc::new(VoiceSlot::default())],
@@ -482,24 +482,18 @@ impl ShortcutManager {
             backend.stop();
         }
 
-        let mut errors = Vec::new();
-        // 1. Unregister targeted known keys
-        for key in keys {
-            if let Err(e) = app.global_shortcut().unregister(key.as_str()) {
-                errors.push(format!("{key}: {e}"));
-            }
-        }
-        // 2. Also unregister_all as belt-and-suspenders
-        let _ = app.global_shortcut().unregister_all();
-
         let mut inner = self.lock_inner();
         inner.pressed = [false; 4];
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(format!("UNREGISTER_FAILED: 无法注销快捷键: {}", errors.join("; ")))
-        }
+        transaction::perform_targeted_cleanup(
+            keys,
+            &mut inner.owned_hotkeys,
+            |key| {
+                app.global_shortcut()
+                    .unregister(key)
+                    .map_err(|e| format!("{e}"))
+            },
+        )
     }
 
     fn perform_registration(
@@ -567,7 +561,7 @@ impl ShortcutManager {
         inner.alt_right_backend = backend.backend;
         inner.backend_kind = backend.backend_kind;
         inner.last_registration_errors = errors;
-        inner.registered_tauri_keys = backend.registered_keys;
+        inner.owned_hotkeys.extend(backend.registered_keys);
         inner.pressed = [false; 4];
         inner.registration_generation = inner.registration_generation.wrapping_add(1);
         inner.switching = false;
@@ -587,7 +581,7 @@ impl ShortcutManager {
         let fields = build_fields(&values, &normalized, &graph, &templates, &active, is_windows());
 
         let _guard = self.lock_update();
-        let old_keys = { self.lock_inner().registered_tauri_keys.clone() };
+        let old_keys: Vec<String> = { self.lock_inner().owned_hotkeys.iter().cloned().collect() };
         {
             let mut inner = self.lock_inner();
             inner.switching = true;
@@ -634,9 +628,9 @@ impl ShortcutManager {
             is_windows(),
         )?;
 
-        let (old_fields, old_registered_keys) = {
+        let (old_fields, old_registered_keys): ([FieldRuntime; 4], Vec<String>) = {
             let inner = self.lock_inner();
-            (inner.runtime.clone(), inner.registered_tauri_keys.clone())
+            (inner.runtime.clone(), inner.owned_hotkeys.iter().cloned().collect())
         };
 
         {
@@ -671,14 +665,13 @@ impl ShortcutManager {
                     inner.alt_right_backend = restored_result.backend;
                     inner.backend_kind = restored_result.backend_kind;
                     inner.runtime = old_fields;
-                    inner.registered_tauri_keys = restored_result.registered_keys;
+                    inner.owned_hotkeys.extend(restored_result.registered_keys);
                     inner.last_registration_errors = restored_result.errors;
                     inner.pressed = [false; 4];
                     inner.switching = false;
                 } else {
                     inner.alt_right_backend = None;
                     inner.backend_kind = None;
-                    inner.registered_tauri_keys.clear();
                     inner.last_registration_errors = vec![e.clone()];
                     for f in &mut inner.runtime {
                         f.registered = false;

@@ -1,4 +1,46 @@
-import type { GeneralConfig, ShortcutPatch, ShortcutUpdateResult } from './types'
+import type { AppConfig, GeneralConfig, ShortcutPatch, ShortcutUpdateResult } from './types'
+
+export interface TemplateDeletionCompletion {
+  kind: 'voice' | 'image'
+  deletedId: string
+  confirmedDomain?: ShortcutUpdateResult
+}
+
+/**
+ * Pure helper: compose the next complete AppConfig upon template deletion completion.
+ * Merges confirmed shortcut domain fields into the latest general settings and filters
+ * the latest template list, preserving all concurrent edits (theme, microphone, newly added templates).
+ */
+export function applyTemplateDeletionCompletion(
+  latestConfig: AppConfig,
+  completion: TemplateDeletionCompletion,
+): AppConfig {
+  let general = latestConfig.general
+  if (completion.confirmedDomain) {
+    general = mergeConfirmedShortcutDomain(general, completion.confirmedDomain)
+  }
+  return {
+    ...latestConfig,
+    general,
+    ...(completion.kind === 'voice'
+      ? {
+          voiceTemplates: {
+            ...latestConfig.voiceTemplates,
+            templates: latestConfig.voiceTemplates.templates.filter(
+              t => t.id !== completion.deletedId,
+            ),
+          },
+        }
+      : {
+          extract: {
+            ...latestConfig.extract,
+            templates: latestConfig.extract.templates.filter(
+              t => t.id !== completion.deletedId,
+            ),
+          },
+        }),
+  }
+}
 
 /**
  * Merge a backend-confirmed shortcut domain update into the current GeneralConfig,
