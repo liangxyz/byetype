@@ -193,19 +193,26 @@ export function GeneralTab({ config, onSave, onShortcutChange, onResetShortcuts 
     await onShortcutChange({ [field]: value } as ShortcutPatch)
   }
 
-  // 开关只切换 enabled，不改任何模板选择与快捷键；
+  // 开关通过快捷键域专属通道保存，不改任何未指定的模板选择与快捷键；
   // 旧配置里「输出风格选无」存的是空模板，打开时补一个可用默认项。
-  const setStrengthening = (enabled: boolean) => {
-    if (!enabled) {
-      update({ textStrengtheningEnabled: false })
-      return
+  const setStrengthening = async (enabled: boolean) => {
+    try {
+      await onShortcutChange({
+        textStrengtheningEnabled: enabled,
+        shortcutTemplate: enabled
+          ? config.general.shortcutTemplate || voiceTemplates[0]?.id || ''
+          : undefined,
+        shortcut2Template: enabled
+          ? config.general.shortcut2Template || voiceTemplates[1]?.id || voiceTemplates[0]?.id || ''
+          : undefined,
+      })
+    } catch (error: unknown) {
+      showShortcutError(
+        typeof error === 'string'
+          ? error
+          : (error as { message?: string } | null)?.message || '切换文本强化失败',
+      )
     }
-    update({
-      textStrengtheningEnabled: true,
-      shortcutTemplate: config.general.shortcutTemplate || voiceTemplates[0]?.id || '',
-      shortcut2Template:
-        config.general.shortcut2Template || voiceTemplates[1]?.id || voiceTemplates[0]?.id || '',
-    })
   }
 
   const themes: { value: ThemeMode; label: string; style: React.CSSProperties }[] = [
@@ -266,7 +273,7 @@ export function GeneralTab({ config, onSave, onShortcutChange, onResetShortcuts 
                 <TemplateSelect
                   value={config.general.shortcutTemplate}
                   templates={voiceTemplates}
-                  onChange={templateId => update({ shortcutTemplate: templateId })}
+                  onChange={templateId => onShortcutChange({ shortcutTemplate: templateId })}
                 />
                 <ShortcutInput
                   field="shortcut"
@@ -282,7 +289,7 @@ export function GeneralTab({ config, onSave, onShortcutChange, onResetShortcuts 
                 <TemplateSelect
                   value={config.general.shortcut2Template}
                   templates={voiceTemplates}
-                  onChange={templateId => update({ shortcut2Template: templateId })}
+                  onChange={templateId => onShortcutChange({ shortcut2Template: templateId })}
                 />
                 <ShortcutInput
                   field="shortcut2"
@@ -340,7 +347,7 @@ export function GeneralTab({ config, onSave, onShortcutChange, onResetShortcuts 
             <TemplateSelect
               value={config.general.extractShortcutTemplate}
               templates={config.extract.templates}
-              onChange={templateId => update({ extractShortcutTemplate: templateId })}
+              onChange={templateId => onShortcutChange({ extractShortcutTemplate: templateId })}
             />
             <ShortcutInput
               field="extractShortcut"
@@ -356,7 +363,7 @@ export function GeneralTab({ config, onSave, onShortcutChange, onResetShortcuts 
             <TemplateSelect
               value={config.general.extractShortcut2Template}
               templates={config.extract.templates}
-              onChange={templateId => update({ extractShortcut2Template: templateId })}
+              onChange={templateId => onShortcutChange({ extractShortcut2Template: templateId })}
             />
             <ShortcutInput
               field="extractShortcut2"

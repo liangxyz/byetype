@@ -52,43 +52,23 @@ pub async fn save_config(
     recorder: State<'_, Arc<AudioRecorder>>,
     local_api_manager: State<'_, crate::local_api::LocalApiManager>,
     config: AppConfig,
+    shortcut_patch: Option<crate::shortcut::ShortcutDomainPatch>,
 ) -> Result<bool, String> {
     config.validate()?;
     let old_config = config_manager.get();
     let recorder = recorder.inner().clone();
 
-    // 1. 构建快捷键域补丁（只包含确实变动的部分）
-    let domain_patch = crate::shortcut::ShortcutDomainPatch {
-        shortcut: (config.general.shortcut != old_config.general.shortcut)
-            .then(|| config.general.shortcut.clone()),
-        shortcut2: (config.general.shortcut2 != old_config.general.shortcut2)
-            .then(|| config.general.shortcut2.clone()),
-        extract_shortcut: (config.general.extract_shortcut != old_config.general.extract_shortcut)
-            .then(|| config.general.extract_shortcut.clone()),
-        extract_shortcut2: (
-            config.general.extract_shortcut2 != old_config.general.extract_shortcut2
-        )
-        .then(|| config.general.extract_shortcut2.clone()),
-        shortcut_template: (config.general.shortcut_template != old_config.general.shortcut_template)
-            .then(|| config.general.shortcut_template.clone()),
-        shortcut2_template: (config.general.shortcut2_template != old_config.general.shortcut2_template)
-            .then(|| config.general.shortcut2_template.clone()),
-        extract_shortcut_template: (config.general.extract_shortcut_template != old_config.general.extract_shortcut_template)
-            .then(|| config.general.extract_shortcut_template.clone()),
-        extract_shortcut2_template: (config.general.extract_shortcut2_template != old_config.general.extract_shortcut2_template)
-            .then(|| config.general.extract_shortcut2_template.clone()),
-        text_strengthening_enabled: (config.general.text_strengthening_enabled != old_config.general.text_strengthening_enabled)
-            .then_some(config.general.text_strengthening_enabled),
+    // 1. 显式领域补丁：仅在调用方显式携带补丁时在领域锁内严格执行与持久化。
+    // 严禁从全量快照推导快捷键域意图，彻底杜绝前端旧快照竞态回退快捷键、模板或强化开关。
+    let shortcut_domain_changed = match &shortcut_patch {
+        Some(patch) if !patch.is_empty() => {
+            crate::shortcut::update_shortcut_settings(&app, &recorder, patch)?;
+            true
+        }
+        _ => false,
     };
 
-    let shortcut_domain_changed = !domain_patch.is_empty();
-
-    // 2. 如果快捷键域有变动，在领域锁内完成严格切换与原子写盘（包括键位、模板及强化开关）
-    if shortcut_domain_changed {
-        crate::shortcut::update_shortcut_settings(&app, &recorder, &domain_patch)?;
-    }
-
-    // 3. 保存非快捷键配置（Local API 与其他通用设置）
+    // 2. 配置 Local API（若失败且伴随快捷键变更，明确声明部分成功）
     if let Err(error) = local_api_manager
         .configure(app.clone(), &config.local_api)
         .await
@@ -101,6 +81,7 @@ pub async fn save_config(
         return Err(error);
     }
 
+    // 3. 保存非快捷键配置
     // ConfigManager::update 受 SHORTCUT_DOMAIN_KEYS 保护，绝不会覆盖快捷键、模板与强化开关
     if let Err(error) = config_manager.update(config) {
         let rollback_res = local_api_manager

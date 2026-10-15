@@ -471,7 +471,7 @@ impl ShortcutManager {
 
     // ---------- registration ----------
 
-    fn teardown(&self, app: &AppHandle) {
+    fn teardown(&self, app: &AppHandle) -> Result<(), String> {
         let backend = {
             let mut inner = self.lock_inner();
             inner.alt_right_backend.take()
@@ -479,9 +479,13 @@ impl ShortcutManager {
         if let Some(mut backend) = backend {
             backend.stop();
         }
-        let _ = app.global_shortcut().unregister_all();
+        let unreg_res = app
+            .global_shortcut()
+            .unregister_all()
+            .map_err(|e| format!("UNREGISTER_FAILED: 无法注销既有快捷键: {e}"));
         let mut inner = self.lock_inner();
         inner.pressed = [false; 4];
+        unreg_res
     }
 
     fn perform_registration(
@@ -567,7 +571,7 @@ impl ShortcutManager {
             let mut inner = self.lock_inner();
             inner.switching = true;
         }
-        self.teardown(app);
+        let _ = self.teardown(app);
         let result = self.perform_registration(app, &fields);
         for error in &result.errors {
             eprintln!("[shortcut] 启动注册警告: {error}");

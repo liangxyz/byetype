@@ -308,11 +308,11 @@ pub fn plan_shortcut_transaction(
     })
 }
 
-pub fn execute_transaction_workflow<R, P, B, S>(
+pub fn execute_transaction_workflow<R, P, B, S, T>(
     plan: &TransactionPlan,
     old_fields: &[FieldRuntime; 4],
     mut register_fn: R,
-    mut teardown_fn: impl FnMut(),
+    mut teardown_fn: T,
     mut persist_fn: P,
     mut stop_backend_fn: B,
     mut install_restored_fn: S,
@@ -322,19 +322,24 @@ where
     P: FnMut(&ShortcutDomainPersist) -> Result<(), String>,
     B: FnMut(&mut Option<AltRightBackend>),
     S: FnMut(RegistrationResult),
+    T: FnMut() -> Result<(), String>,
 {
-    teardown_fn();
+    teardown_fn()?;
     let mut result = register_fn(&plan.fields);
     if !result.errors.is_empty() {
         stop_backend_fn(&mut result.backend);
-        teardown_fn();
+        let teardown_err = teardown_fn().err();
         let mut rollback = register_fn(old_fields);
-        if !rollback.errors.is_empty() {
+        if !rollback.errors.is_empty() || teardown_err.is_some() {
             stop_backend_fn(&mut rollback.backend);
-            teardown_fn();
+            let _ = teardown_fn();
+            let mut all_errors = result.errors;
+            if let Some(te) = teardown_err {
+                all_errors.push(te);
+            }
             return Err(format!(
                 "SHORTCUT_ROLLBACK_FAILED: 新注册失败: {}; 回滚失败: {}",
-                result.errors.join("; "),
+                all_errors.join("; "),
                 rollback.errors.join("; ")
             ));
         }
@@ -348,14 +353,18 @@ where
     if !plan.persist.is_empty() {
         if let Err(error) = persist_fn(&plan.persist) {
             stop_backend_fn(&mut result.backend);
-            teardown_fn();
+            let teardown_err = teardown_fn().err();
             let mut rollback = register_fn(old_fields);
-            if !rollback.errors.is_empty() {
+            if !rollback.errors.is_empty() || teardown_err.is_some() {
                 stop_backend_fn(&mut rollback.backend);
-                teardown_fn();
+                let _ = teardown_fn();
+                let mut err_msg = error;
+                if let Some(te) = teardown_err {
+                    err_msg.push_str(&format!("; {te}"));
+                }
                 return Err(format!(
                     "SHORTCUT_ROLLBACK_FAILED: 写盘失败后回滚失败: {}; {}",
-                    error,
+                    err_msg,
                     rollback.errors.join("; ")
                 ));
             }
@@ -373,6 +382,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use crate::shortcut::native;
+    use crate::config::shortcut_config;
 
     #[test]
     fn plan_transaction_normalizes_backspace_to_empty() {
@@ -569,7 +579,7 @@ mod tests {
                     }
                 }
             },
-            || {},
+            || Ok(()),
             |_| Ok(()),
             |_| {},
             |restored| {
@@ -623,7 +633,7 @@ mod tests {
                     }
                 }
             },
-            || {},
+            || Ok(()),
             |_| Err("IO write failure".to_string()),
             |_| {},
             |restored| {
@@ -677,7 +687,7 @@ mod tests {
                     }
                 }
             },
-            || {},
+            || Ok(()),
             |_| Ok(()),
             |backend_opt| {
                 if let Some(mut backend) = backend_opt.take() {
@@ -775,5 +785,216 @@ mod tests {
         let fields_prefix = build_fields(&values_prefix, &normalized_prefix, &graph_prefix, &templates, &active, true);
         assert!(fields_prefix[0].registered);
         assert!(!fields_prefix[1].registered);
+    }
+
+    #[test]
+    fn observable_state_successful_transaction_persists_all_fields_together() {
+        let mut raw_disk = serde_json::json!({
+            "general": {
+                "shortcut": "F4",
+                "shortcut2": "F5",
+                "extractShortcut": "F6",
+                "extractShortcut2": "",
+                "shortcutTemplate": "t1",
+                "shortcut2Template": "t2",
+                "extractShortcutTemplate": "t3",
+                "extractShortcut2Template": "t4",
+                "textStrengtheningEnabled": false,
+                "theme": "dark"
+            }
+        });
+
+        let patch = ShortcutDomainPatch {
+            shortcut: Some("F8".to_string()),
+            shortcut_template: Some("new-tpl".to_string()),
+            text_strengthening_enabled: Some(true),
+            ..Default::default()
+        };
+
+        let current_values = ["F4".to_string(), "F5".to_string(), "F6".to_string(), "".to_string()];
+        let current_templates = ["t1".to_string(), "t2".to_string(), "t3".to_string(), "t4".to_string()];
+        let plan = plan_shortcut_transaction(&current_values, &current_templates, false, &patch, true).unwrap();
+        let old_fields = std::array::from_fn(|i| FieldRuntime::empty(ShortcutField::ALL[i]));
+
+        let mut registered_map = [false; 4];
+        let result = execute_transaction_workflow(
+            &plan,
+            &old_fields,
+            |fields| {
+                for i in 0..4 {
+                    registered_map[i] = fields[i].registered;
+                }
+                RegistrationResult {
+                    registered: registered_map,
+                    ..Default::default()
+                }
+            },
+            || Ok(()),
+            |persist| {
+                shortcut_config::apply_shortcut_domain_persist(&mut raw_disk, persist)
+            },
+            |_| {},
+            |_| {},
+        ).unwrap();
+
+        // Runtime reflects new registration
+        assert!(result.registered[0], "Slot 0 must be registered");
+        assert!(result.registered[1], "Slot 1 must now be registered because strengthening is true");
+
+        // Disk reflects all changed domain fields together, while theme is preserved
+        assert_eq!(raw_disk["general"]["shortcut"], "F8");
+        assert_eq!(raw_disk["general"]["shortcutTemplate"], "new-tpl");
+        assert_eq!(raw_disk["general"]["textStrengtheningEnabled"], true);
+        assert_eq!(raw_disk["general"]["theme"], "dark");
+    }
+
+    #[test]
+    fn observable_state_registration_failure_leaves_disk_unchanged_and_restores_old_mapping() {
+        let mut raw_disk = serde_json::json!({
+            "general": {
+                "shortcut": "F4",
+                "shortcut2": "F5",
+                "textStrengtheningEnabled": false
+            }
+        });
+
+        let patch = ShortcutDomainPatch {
+            shortcut: Some("F8".to_string()),
+            text_strengthening_enabled: Some(true),
+            ..Default::default()
+        };
+
+        let current_values = ["F4".to_string(), "F5".to_string(), "F6".to_string(), "".to_string()];
+        let current_templates = std::array::from_fn(|_| "".to_string());
+        let plan = plan_shortcut_transaction(&current_values, &current_templates, false, &patch, true).unwrap();
+
+        let mut old_fields = std::array::from_fn(|i| FieldRuntime::empty(ShortcutField::ALL[i]));
+        old_fields[0].registered = true;
+        old_fields[0].value = "F4".to_string();
+
+        let mut current_registered_map = [true, false, false, false];
+        let mut restored_result: Option<RegistrationResult> = None;
+
+        let err = execute_transaction_workflow(
+            &plan,
+            &old_fields,
+            |fields| {
+                if fields[0].value == "F8" {
+                    RegistrationResult {
+                        errors: vec!["OS conflict on F8".to_string()],
+                        ..Default::default()
+                    }
+                } else {
+                    current_registered_map = [fields[0].registered, fields[1].registered, fields[2].registered, fields[3].registered];
+                    RegistrationResult {
+                        registered: current_registered_map,
+                        ..Default::default()
+                    }
+                }
+            },
+            || Ok(()),
+            |persist| shortcut_config::apply_shortcut_domain_persist(&mut raw_disk, persist),
+            |_| {},
+            |restored| {
+                restored_result = Some(restored);
+            },
+        ).unwrap_err();
+
+        assert!(err.contains("SHORTCUT_REGISTER_FAILED"));
+
+        // Disk remains completely untouched
+        assert_eq!(raw_disk["general"]["shortcut"], "F4");
+        assert_eq!(raw_disk["general"]["textStrengtheningEnabled"], false);
+
+        // Runtime mapping restored to old fields
+        assert_eq!(current_registered_map, [true, false, false, false]);
+        assert!(restored_result.is_some());
+    }
+
+    #[test]
+    fn observable_state_persistence_failure_restores_old_mapping_and_live_backend() {
+        let raw_disk = serde_json::json!({ "general": { "shortcut": "AltRight" } });
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let drop_count_clone = drop_count.clone();
+
+        let patch = ShortcutDomainPatch {
+            shortcut: Some("F8".to_string()),
+            ..Default::default()
+        };
+
+        let current_values = ["AltRight".to_string(), "".to_string(), "".to_string(), "".to_string()];
+        let current_templates = std::array::from_fn(|_| "".to_string());
+        let plan = plan_shortcut_transaction(&current_values, &current_templates, false, &patch, true).unwrap();
+
+        let mut old_fields = std::array::from_fn(|i| FieldRuntime::empty(ShortcutField::ALL[i]));
+        old_fields[0].registered = true;
+        old_fields[0].uses_native_alt_right = true;
+
+        let mut restored_backend: Option<AltRightBackend> = None;
+
+        let err = execute_transaction_workflow(
+            &plan,
+            &old_fields,
+            |fields| {
+                if fields[0].value == "F8" {
+                    RegistrationResult {
+                        registered: [true, false, false, false],
+                        ..Default::default()
+                    }
+                } else {
+                    let dc = drop_count_clone.clone();
+                    let backend = native::make_backend(BackendKind::RawInput, Box::new(move || {
+                        dc.fetch_add(1, Ordering::SeqCst);
+                    }));
+                    RegistrationResult {
+                        backend: Some(backend),
+                        backend_kind: Some(BackendKind::RawInput),
+                        registered: [true, false, false, false],
+                        errors: Vec::new(),
+                    }
+                }
+            },
+            || Ok(()),
+            |_persist| {
+                // Disk write fails
+                Err("Simulated disk error".to_string())
+            },
+            |_| {},
+            |restored| {
+                restored_backend = restored.backend;
+            },
+        ).unwrap_err();
+
+        assert_eq!(err, "Simulated disk error");
+        assert_eq!(raw_disk["general"]["shortcut"], "AltRight");
+        assert_eq!(drop_count.load(Ordering::SeqCst), 0, "Restored backend must NOT be dropped on persist error return");
+        assert!(restored_backend.is_some());
+
+        drop(restored_backend);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1, "Backend dropped only after adopted owner drops");
+    }
+
+    #[test]
+    fn observable_state_teardown_failure_fails_transaction() {
+        let plan = plan_shortcut_transaction(
+            &["F4".to_string(), "".to_string(), "".to_string(), "".to_string()],
+            &std::array::from_fn(|_| "".to_string()),
+            false,
+            &ShortcutDomainPatch { shortcut: Some("F8".to_string()), ..Default::default() },
+            true,
+        ).unwrap();
+        let old_fields = std::array::from_fn(|i| FieldRuntime::empty(ShortcutField::ALL[i]));
+
+        let err = execute_transaction_workflow(
+            &plan,
+            &old_fields,
+            |_| RegistrationResult::default(),
+            || Err("UNREGISTER_FAILED: OS unregister error".to_string()),
+            |_| Ok(()),
+            |_| {},
+            |_| {},
+        ).unwrap_err();
+
+        assert!(err.contains("UNREGISTER_FAILED"));
     }
 }

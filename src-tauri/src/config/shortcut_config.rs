@@ -724,4 +724,40 @@ mod tests {
         // Non-shortcut field was updated
         assert_eq!(raw["general"]["theme"], "dark");
     }
+
+    #[test]
+    fn stale_full_config_save_cannot_revert_newer_key_template_or_strengthening() {
+        let mut raw = json!({
+            "general": {
+                "shortcut": "F8",
+                "shortcut2": "F9",
+                "shortcutTemplate": "new-tpl",
+                "textStrengtheningEnabled": true,
+                "theme": "light",
+                SCHEMA_VERSION_KEY: 1
+            }
+        });
+
+        // A stale frontend snapshot arrives from an older state
+        let stale_incoming = json!({
+            "general": {
+                "shortcut": "AltRight",
+                "shortcut2": "F4",
+                "shortcutTemplate": "old-tpl",
+                "textStrengtheningEnabled": false,
+                "theme": "dark" // User only changed theme in this save
+            }
+        });
+
+        merge_config_preserving_shortcuts(&mut raw, stale_incoming);
+
+        // The shortcut domain keys are strictly preserved
+        assert_eq!(raw["general"]["shortcut"], "F8");
+        assert_eq!(raw["general"]["shortcut2"], "F9");
+        assert_eq!(raw["general"]["shortcutTemplate"], "new-tpl");
+        assert_eq!(raw["general"]["textStrengtheningEnabled"], true);
+
+        // Non-domain key is updated
+        assert_eq!(raw["general"]["theme"], "dark");
+    }
 }
