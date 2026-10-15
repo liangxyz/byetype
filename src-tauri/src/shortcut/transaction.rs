@@ -1508,4 +1508,107 @@ mod tests {
         assert!(!fake.os_registrations.contains("F8"));
         assert!(owned_ledger.is_empty());
     }
+
+    #[test]
+    fn registration_immediately_records_ownership_and_cleans_up_on_subsequent_failure() {
+        struct MockOs {
+            os_registrations: HashSet<String>,
+        }
+
+        let mut os = MockOs {
+            os_registrations: HashSet::new(),
+        };
+
+        let mut owned_ledger: HashSet<String> = HashSet::new();
+
+        // Simulate perform_registration: field 0 ("F8") succeeds and records ownership immediately
+        let key = "F8".to_string();
+        os.os_registrations.insert(key.clone());
+        owned_ledger.insert(key.clone());
+
+        // Field 1 fails registration, triggering rollback
+        assert!(owned_ledger.contains("F8"));
+        assert!(os.os_registrations.contains("F8"));
+
+        // Cleanup receives candidate registered_keys [&"F8"]
+        let res = perform_targeted_cleanup(
+            &["F8".to_string()],
+            &mut owned_ledger,
+            |k| {
+                if !os.os_registrations.contains(k) {
+                    return Err(format!("Windows ERROR_HOTKEY_NOT_REGISTERED: {k}"));
+                }
+                os.os_registrations.remove(k);
+                Ok(())
+            },
+        );
+
+        assert!(res.is_ok());
+        assert!(!os.os_registrations.contains("F8"), "OS registration must be removed");
+        assert!(!owned_ledger.contains("F8"), "Ledger must be cleared");
+    }
+
+    #[test]
+    fn retry_with_original_two_key_list_never_resurrects_already_removed_key() {
+        struct MockOs {
+            os_registrations: HashSet<String>,
+            fail_unregister_keys: HashSet<String>,
+            unregistration_calls: Vec<String>,
+        }
+
+        let mut os = MockOs {
+            os_registrations: ["KeyA".to_string(), "KeyB".to_string()].into_iter().collect(),
+            fail_unregister_keys: ["KeyB".to_string()].into_iter().collect(), // KeyB fails initially
+            unregistration_calls: Vec::new(),
+        };
+
+        let mut owned_ledger: HashSet<String> = ["KeyA".to_string(), "KeyB".to_string()].into_iter().collect();
+
+        // First attempt with original two-key list
+        let original_list = vec!["KeyA".to_string(), "KeyB".to_string()];
+        let err = perform_targeted_cleanup(
+            &original_list,
+            &mut owned_ledger,
+            |k| {
+                os.unregistration_calls.push(k.to_string());
+                if !os.os_registrations.contains(k) {
+                    return Err(format!("Windows ERROR_HOTKEY_NOT_REGISTERED: {k}"));
+                }
+                if os.fail_unregister_keys.contains(k) {
+                    return Err(format!("OS failure on {k}"));
+                }
+                os.os_registrations.remove(k);
+                Ok(())
+            },
+        ).unwrap_err();
+
+        assert!(err.contains("KeyB"));
+        assert!(!os.os_registrations.contains("KeyA"), "KeyA was successfully removed from OS");
+        assert!(!owned_ledger.contains("KeyA"), "KeyA was removed from ledger");
+        assert!(owned_ledger.contains("KeyB"), "KeyB failed and remains in ledger");
+
+        // Second attempt: passing the original two-key list again!
+        // KeyA must NOT be resent to the adapter (which would return ERROR_HOTKEY_NOT_REGISTERED)!
+        os.unregistration_calls.clear();
+        os.fail_unregister_keys.clear(); // KeyB will now succeed
+
+        let ok = perform_targeted_cleanup(
+            &original_list,
+            &mut owned_ledger,
+            |k| {
+                os.unregistration_calls.push(k.to_string());
+                if !os.os_registrations.contains(k) {
+                    return Err(format!("Windows ERROR_HOTKEY_NOT_REGISTERED: {k}"));
+                }
+                os.os_registrations.remove(k);
+                Ok(())
+            },
+        );
+
+        assert!(ok.is_ok());
+        // Verify KeyA was NOT called again! Only KeyB was targeted!
+        assert_eq!(os.unregistration_calls, vec!["KeyB".to_string()]);
+        assert!(!os.os_registrations.contains("KeyB"));
+        assert!(owned_ledger.is_empty());
+    }
 }

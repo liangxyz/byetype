@@ -522,7 +522,12 @@ impl ShortcutManager {
                 Ok(()) => {
                     result.registered[index] = true;
                     if let Some(canonical) = field.normalized.canonical() {
-                        result.registered_keys.push(canonical.to_string());
+                        let key_str = canonical.to_string();
+                        {
+                            let mut inner = self.lock_inner();
+                            inner.owned_hotkeys.insert(key_str.clone());
+                        }
+                        result.registered_keys.push(key_str);
                     }
                 }
                 Err(error) => result.errors.push(error),
