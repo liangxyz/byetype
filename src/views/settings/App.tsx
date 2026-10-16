@@ -14,6 +14,7 @@ import { VoiceLearningTab } from './tabs/VoiceLearningTab'
 import type { AppConfig, UpdateState, UpdateInfo, ShortcutPatch, ShortcutUpdateResult } from '../../core/types'
 import { applyTemplateDeletionCompletion, mergeConfirmedShortcutDomain } from '../../core/shortcut-domain'
 import { getVersion } from '@tauri-apps/api/app'
+import { errorToMessage, loadWithRetry } from '../../core/retry'
 import { getConfig, saveConfig, onEvent, checkUpdate, updateShortcuts, resetShortcuts } from '../../lib/tauri-api'
 import './theme.css'
 
@@ -53,6 +54,8 @@ const INITIAL_UPDATE_STATE: UpdateState = {
 export function App() {
   const [activeTab, setActiveTab] = useState('general')
   const [config, setConfig] = useState<AppConfig | null>(null)
+  const [loadError, setLoadError] = useState('')
+  const [loadNonce, setLoadNonce] = useState(0)
   const configRef = useRef<AppConfig | null>(null)
 
   const publishConfig = useCallback((next: AppConfig) => {
@@ -71,7 +74,20 @@ export function App() {
 
   useEffect(() => {
     let cancelled = false
-    getConfig().then((c) => { if (!cancelled) publishConfig(c) })
+    // The settings webview is created at app start and may call get_config before
+    // the backend has registered its state. Retry instead of staying on "Loading..."
+    // forever, and surface the real error if it never succeeds.
+    setLoadError('')
+    loadWithRetry(() => getConfig(), {
+      attempts: 20,
+      delayMs: 500,
+      isCancelled: () => cancelled,
+      onRetry: (error, attempt) => console.warn(`get_config failed (attempt ${attempt}), retrying:`, error),
+    })
+      .then((c) => { if (!cancelled) publishConfig(c) })
+      .catch((error) => {
+        if (!cancelled) setLoadError(errorToMessage(error, '无法读取配置'))
+      })
     getVersion().then((v) => { if (!cancelled) setAppVersion(v) })
 
     let unsubUpdateAvailable: (() => void) | null = null
@@ -133,7 +149,7 @@ export function App() {
       unsubError?.()
       unsubNavigate?.()
     }
-  }, [])
+  }, [loadNonce])
 
   useEffect(() => {
     return () => {
@@ -242,7 +258,20 @@ export function App() {
 
   const showDot = updateState.phase === 'available' && !updateState.dismissed
 
-  if (!config) return <div style={{ padding: 20, color: 'var(--text-primary)' }}>Loading...</div>
+  if (!config) {
+    return (
+      <div style={{ padding: 20, color: 'var(--text-primary)' }}>
+        {loadError ? (
+          <>
+            <div style={{ color: '#ff3b30', marginBottom: 12 }}>设置加载失败：{loadError}</div>
+            <button className="file-picker-btn" onClick={() => setLoadNonce(n => n + 1)}>重试</button>
+          </>
+        ) : (
+          'Loading...'
+        )}
+      </div>
+    )
+  }
 
   const strengtheningEnabled = config.general.textStrengtheningEnabled !== false
 
