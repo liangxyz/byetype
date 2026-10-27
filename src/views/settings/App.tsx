@@ -8,9 +8,8 @@ import { AboutTab } from './tabs/AboutTab'
 import { ExtractTab } from './tabs/ExtractTab'
 import { VoicePromptsTab } from './tabs/VoicePromptsTab'
 import { ExtractPromptsTab } from './tabs/ExtractPromptsTab'
-import { StrengtheningPromptsTab } from './tabs/StrengtheningPromptsTab'
+import { TextOptimizeTab } from './tabs/TextOptimizeTab'
 import { BackupTab } from './tabs/BackupTab'
-import { VoiceLearningTab } from './tabs/VoiceLearningTab'
 import type { AppConfig, UpdateState, UpdateInfo, ShortcutPatch, ShortcutUpdateResult } from '../../core/types'
 import { applyTemplateDeletionCompletion, mergeConfirmedShortcutDomain } from '../../core/shortcut-domain'
 import { getVersion } from '@tauri-apps/api/app'
@@ -29,12 +28,10 @@ const TABS: TabItem[] = [
   { type: 'group', label: '语音识别' },
   { type: 'tab', id: 'transcribe', label: '语音识别设置' },
   { type: 'tab', id: 'voice-prompts', label: '语音识别规则' },
-  { type: 'tab', id: 'strengthening-prompts', label: '文本强化规则', strengtheningOnly: true },
+  { type: 'tab', id: 'text-optimize', label: '文本优化', strengtheningOnly: true },
   { type: 'group', label: '图像识别' },
   { type: 'tab', id: 'extract', label: '图像识别设置' },
-  { type: 'tab', id: 'extract-prompts', label: '图像识别提示词' },
-  { type: 'group', label: '智能学习' },
-  { type: 'tab', id: 'voice-learning', label: '自动学习' },
+  { type: 'tab', id: 'extract-prompts', label: '图像识别规则' },
   { type: 'divider' },
   { type: 'tab', id: 'history', label: '历史记录' },
   { type: 'tab', id: 'usage', label: '用量统计' },
@@ -177,9 +174,9 @@ export function App() {
     return () => mq.removeEventListener('change', handler)
   }, [config?.general.theme])
 
-  // 关掉文本强化时，停在强化规则页就退回通用设置
+  // 关掉文本优化时，停在文本优化页就退回通用设置
   useEffect(() => {
-    if (config && config.general.textStrengtheningEnabled === false && activeTab === 'strengthening-prompts') {
+    if (config && config.general.textStrengtheningEnabled === false && activeTab === 'text-optimize') {
       setActiveTab('general')
     }
   }, [config, activeTab])
@@ -275,7 +272,7 @@ export function App() {
 
   const strengtheningEnabled = config.general.textStrengtheningEnabled !== false
 
-  // 文本强化关闭时，强化规则入口不显示；正停在那一页时退回通用设置
+  // 文本优化关闭时，文本优化入口不显示；正停在那一页时退回通用设置
   const visibleTabs = TABS.filter(item =>
     item.type !== 'tab' || !item.strengtheningOnly || strengtheningEnabled
   )
@@ -319,11 +316,10 @@ export function App() {
         {activeTab === 'general' && <GeneralTab config={config} onSave={handleSave} onShortcutChange={handleShortcutChange} onResetShortcuts={handleResetShortcuts} />}
         {activeTab === 'transcribe' && <TranscribeTab config={config} onSave={handleSave} />}
         {activeTab === 'models' && <ModelsTab config={config} onSave={handleSave} />}
-        {activeTab === 'voice-learning' && <VoiceLearningTab config={config} onSave={handleSave} />}
         {activeTab === 'extract' && <ExtractTab config={config} onSave={handleSave} />}
         {activeTab === 'voice-prompts' && <VoicePromptsTab config={config} onSave={handleSave} />}
-        {activeTab === 'strengthening-prompts' && strengtheningEnabled && (
-          <StrengtheningPromptsTab config={config} onSave={handleSave} onDeleteTemplate={handleTemplateDelete} />
+        {activeTab === 'text-optimize' && strengtheningEnabled && (
+          <TextOptimizeTab config={config} onSave={handleSave} onDeleteTemplate={handleTemplateDelete} />
         )}
         {activeTab === 'extract-prompts' && <ExtractPromptsTab config={config} onSave={handleSave} onDeleteTemplate={handleTemplateDelete} />}
         {activeTab === 'backup' && config && <BackupTab config={config} onSave={handleSave} />}

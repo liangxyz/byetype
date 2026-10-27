@@ -211,7 +211,7 @@ export function GeneralTab({ config, onSave, onShortcutChange, onResetShortcuts 
       showShortcutError(
         typeof error === 'string'
           ? error
-          : (error as { message?: string } | null)?.message || '切换文本强化失败',
+          : (error as { message?: string } | null)?.message || '切换文本优化失败',
       )
     }
   }
@@ -260,8 +260,8 @@ export function GeneralTab({ config, onSave, onShortcutChange, onResetShortcuts 
         <SettingRow
           label={
             <span className="mode-label">
-              文本强化
-              <span className="strengthening-formula">（语音识别文本＋强化规则＝最终文本）</span>
+              文本优化
+              <span className="strengthening-formula">（识别文本＋规则＝最终文本）</span>
             </span>
           }
         >

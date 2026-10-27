@@ -2,7 +2,6 @@ import type { AppConfig } from '../../../core/types'
 import { findModel, getTextModels, supportsMinimalThinking } from '../../../core/models'
 import {
   getVoiceLearningDocument,
-  getVoiceLearningPromptPath,
   saveVoiceLearningDocument,
 } from '../../../lib/tauri-api'
 import { PromptEditor, type PromptFileEntry } from '../components/PromptEditor'
@@ -11,11 +10,6 @@ import { SettingRow } from '../components/SettingRow'
 import { Toggle } from '../components/Toggle'
 
 const LEARNING_FILES: PromptFileEntry[] = [
-  {
-    key: 'voice-learning-prompt',
-    label: '学习提示词',
-    resolvePath: getVoiceLearningPromptPath,
-  },
   {
     key: 'voice-learning-result',
     label: '学习结果',
@@ -30,7 +24,7 @@ interface Props {
   onSave: (config: AppConfig) => void
 }
 
-export function VoiceLearningTab({ config, onSave }: Props) {
+export function VoiceLearningSection({ config, onSave }: Props) {
   const textModels = getTextModels(config)
   const builtinModels = textModels.filter(model => model.builtin)
   const customModels = textModels.filter(model => !model.builtin)
@@ -68,9 +62,7 @@ export function VoiceLearningTab({ config, onSave }: Props) {
   }
 
   return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'auto' }}>
-      <h2 className="content-title" style={{ flexShrink: 0 }}>自动学习</h2>
-
+    <div>
       <SettingGroup title="模型">
         <SettingRow label="学习模型" description="用于对比原始转写与用户修改文本，并归纳纠错规则">
           <select
@@ -132,7 +124,7 @@ export function VoiceLearningTab({ config, onSave }: Props) {
         )}
       </SettingGroup>
 
-      <h3 className="section-title">学习文档</h3>
+      <h3 className="section-title">学习结果</h3>
       <PromptEditor config={config} onSave={onSave} promptFiles={LEARNING_FILES} editorHeight={320} />
     </div>
   )
